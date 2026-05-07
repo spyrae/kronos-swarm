@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from kronos.persona import build_system_prompt, load_persona
+from kronos.persona import MAX_USER_MODEL_CHARS, build_system_prompt, load_persona, load_user_model
 from kronos.workspace import Workspace
 
 
@@ -47,6 +47,31 @@ class TestBuildSystemPrompt:
         assert "Kronos INTJ" in prompt
         assert "Boundaries" in prompt
         assert "User prefers Russian" in prompt
+
+    def test_user_model_injected_after_memory(self, tmp_path, monkeypatch):
+        test_ws = _make_workspace(tmp_path, {
+            "self/IDENTITY.md": "# Kronos",
+            "notes/user/MEMORY.md": "Durable facts",
+            "notes/user/USER-MODEL.md": "## Beliefs\n- [0.9] Prefers concise technical answers",
+        })
+        monkeypatch.setattr("kronos.workspace.ws", test_ws)
+        prompt = build_system_prompt()
+
+        memory_pos = prompt.index("Durable facts")
+        model_pos = prompt.index("Prefers concise technical answers")
+        assert "# Dialectic User Model" in prompt
+        assert memory_pos < model_pos
+
+    def test_user_model_is_truncated(self, tmp_path, monkeypatch):
+        test_ws = _make_workspace(tmp_path, {
+            "notes/user/USER-MODEL.md": "x" * (MAX_USER_MODEL_CHARS + 100),
+        })
+        monkeypatch.setattr("kronos.workspace.ws", test_ws)
+
+        result = load_user_model()
+
+        assert len(result) < MAX_USER_MODEL_CHARS + 100
+        assert "[User model truncated]" in result
 
     def test_handoff_loaded_first(self, tmp_path, monkeypatch):
         test_ws = _make_workspace(tmp_path, {

@@ -24,7 +24,9 @@ _tools: list[BaseTool] = []
 _search_agent = None
 
 MAX_ITERATIONS = 2
-MIN_QUALITY_SCORE = 60
+MIN_QUALITY_SCORE = 45
+SELF_CORRECTION_SCORE = 75
+MAX_CORRECTIONS = 1
 
 
 def set_tools(tools: list[BaseTool], on_tool_event=None) -> None:
@@ -192,25 +194,206 @@ def evaluate_quality(state: DeepResearchState) -> DeepResearchState:
     """Evaluate if we have enough data or need more searches."""
     results = state.get("search_results", [])
     iteration = state.get("iteration", 0)
+    mode = state.get("mode", "topic")
+    topic = state.get("topic", "")
 
-    # Simple heuristic: quality based on amount of data
+    judged = _judge_research_quality(results, mode, topic)
+    if judged:
+        score, feedback = judged
+    else:
+        score, feedback = _score_research_quality(results, mode)
+
+    log.info(
+        "Quality evaluation: score=%d, results=%d, feedback=%s, iteration=%d",
+        score, len(results), feedback[:200], iteration,
+    )
+    return {"quality_score": score, "quality_feedback": feedback}
+
+
+def _judge_research_quality(
+    results: list[SearchResult],
+    mode: str,
+    topic: str,
+) -> tuple[int, str] | None:
+    """Use a cheap LLM judge for source quality, falling back on any failure."""
+    if not results:
+        return None
+
+    context = _build_research_context(results, max_chars=8000)
+    prompt = f"""You are a strict quality judge for a Deep Research pipeline.
+
+Research topic: {topic}
+Mode: {mode}
+
+Collected source material:
+{context}
+
+Score the collected material from 0 to 100 by these criteria:
+- relevance: does the material answer the user's research request?
+- completeness: are the important aspects covered for this mode?
+- evidence: are claims backed by enough independent source material?
+
+Return ONLY a JSON object:
+{{
+  "relevance": 0,
+  "completeness": 0,
+  "evidence": 0,
+  "score": 0,
+  "weak_areas": ["..."],
+  "feedback": "Concrete instructions for search or synthesis."
+}}"""
+
+    try:
+        model = get_model(ModelTier.LITE)
+        response = model.invoke([HumanMessage(content=prompt)])
+        content = response.content if isinstance(response.content, str) else str(response.content)
+        data = _parse_json_object(content)
+    except Exception as e:
+        log.warning("Quality judge failed, falling back to heuristic: %s", e)
+        return None
+
+    if not data:
+        return None
+
+    score = _coerce_score(data.get("score"))
+    if score is None:
+        subscores = [
+            _coerce_score(data.get("relevance")),
+            _coerce_score(data.get("completeness")),
+            _coerce_score(data.get("evidence")),
+        ]
+        valid_subscores = [s for s in subscores if s is not None]
+        if not valid_subscores:
+            return None
+        score = round(sum(valid_subscores) / len(valid_subscores))
+
+    weak_areas_raw = data.get("weak_areas", [])
+    weak_areas = weak_areas_raw if isinstance(weak_areas_raw, list) else [str(weak_areas_raw)]
+    feedback = data.get("feedback", "")
+    feedback_text = feedback if isinstance(feedback, str) else str(feedback)
+    return _clamp_score(score), _format_judge_feedback(_clamp_score(score), weak_areas, feedback_text)
+
+
+def _score_research_quality(results: list[SearchResult], mode: str = "topic") -> tuple[int, str]:
+    """Score collected research data and explain concrete gaps."""
     total_chars = sum(len(r["content"]) for r in results)
-    unique_sources = len(set(r["source"] for r in results))
+    unique_sources = {r["source"] for r in results if r.get("source")}
+    source_count = len(unique_sources)
 
-    if total_chars > 10000 and unique_sources >= 2:
-        score = 80
+    score = 20
+    if total_chars > 10000 and source_count >= 2:
+        score = 75
     elif total_chars > 5000:
         score = 60
     elif total_chars > 2000:
         score = 40
-    else:
-        score = 20
 
-    log.info(
-        "Quality evaluation: score=%d, results=%d, chars=%d, sources=%d, iteration=%d",
-        score, len(results), total_chars, unique_sources, iteration,
+    gaps: list[str] = []
+    strengths: list[str] = []
+
+    if not results:
+        gaps.append("No source data was collected.")
+    if total_chars < 2000:
+        gaps.append("Very little source material; claims may be under-supported.")
+    elif total_chars < 5000:
+        gaps.append("Limited source material; final report should avoid broad claims.")
+    else:
+        strengths.append(f"Collected {total_chars} source characters.")
+
+    if source_count < 2:
+        gaps.append("Fewer than two independent source types; cross-checking is weak.")
+    else:
+        strengths.append(f"Collected {source_count} source types: {', '.join(sorted(unique_sources))}.")
+
+    if len(results) < 3:
+        gaps.append("Few result blocks; synthesis should call out evidence limitations.")
+
+    if mode == "validation":
+        gaps.append("For validation, explicitly cover competitors, demand signal, risks, and go/no-go conditions.")
+    elif mode == "market":
+        gaps.append("For market research, explicitly cover audience, pain points, alternatives, and buying triggers.")
+    elif mode == "competitive":
+        gaps.append("For competitive research, explicitly cover positioning, differentiators, pricing, and weaknesses.")
+    elif mode == "trends":
+        gaps.append("For trends, distinguish current evidence from speculation and include counter-signals.")
+
+    if score >= SELF_CORRECTION_SCORE and not gaps:
+        return score, "Quality looks sufficient: enough material and source diversity for synthesis."
+
+    sections = []
+    if strengths:
+        sections.append("Strengths:\n" + "\n".join(f"- {item}" for item in strengths))
+    if gaps:
+        sections.append("Gaps to address:\n" + "\n".join(f"- {item}" for item in gaps))
+    sections.append(
+        "Synthesis instruction: address these gaps directly, label weak evidence, "
+        "and avoid unsupported certainty."
     )
-    return {"quality_score": score}
+    return score, "\n\n".join(sections)
+
+
+def _build_research_context(results: list[SearchResult], max_chars: int) -> str:
+    """Build compact source context for judge and synthesis prompts."""
+    context_parts = []
+    for i, r in enumerate(results, 1):
+        context_parts.append(
+            f"[Source {i}: {r['source']}] Query: {r['query']}\n{r['content'][:2000]}"
+        )
+    return "\n\n---\n\n".join(context_parts)[:max_chars]
+
+
+def _parse_json_object(content: str) -> dict | None:
+    """Parse a JSON object from a model response."""
+    cleaned = content.strip()
+    if "```" in cleaned:
+        parts = cleaned.split("```")
+        cleaned = parts[1] if len(parts) > 1 else cleaned
+        if cleaned.startswith("json"):
+            cleaned = cleaned[4:]
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    try:
+        parsed = json.loads(cleaned[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _coerce_score(value) -> int | None:
+    """Convert model score fields to int when possible."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return round(value)
+    if isinstance(value, str):
+        try:
+            return round(float(value.strip()))
+        except ValueError:
+            return None
+    return None
+
+
+def _clamp_score(score: int) -> int:
+    return max(0, min(100, score))
+
+
+def _format_judge_feedback(score: int, weak_areas: list, feedback: str) -> str:
+    """Format judge output for later search planning and synthesis."""
+    sections = [f"LLM judge score: {score}/100."]
+    cleaned_weak_areas = [str(item).strip() for item in weak_areas if str(item).strip()]
+    if cleaned_weak_areas:
+        sections.append("Weak areas:\n" + "\n".join(f"- {item}" for item in cleaned_weak_areas))
+    if feedback.strip():
+        sections.append(f"Feedback:\n{feedback.strip()}")
+    sections.append(
+        "Synthesis instruction: address these gaps directly, label weak evidence, "
+        "and avoid unsupported certainty."
+    )
+    return "\n\n".join(sections)
 
 
 def should_search_more(state: DeepResearchState) -> str:
@@ -223,20 +406,36 @@ def should_search_more(state: DeepResearchState) -> str:
     return "plan_more_queries"
 
 
+def should_self_correct(state: DeepResearchState) -> bool:
+    """Decide if the final draft needs one bounded self-correction pass."""
+    score = state.get("quality_score", 0)
+    return (
+        MIN_QUALITY_SCORE <= score < SELF_CORRECTION_SCORE
+        and state.get("correction_count", 0) < MAX_CORRECTIONS
+        and bool(state.get("report"))
+        and bool(state.get("quality_feedback"))
+    )
+
+
 def plan_more_queries(state: DeepResearchState) -> DeepResearchState:
     """Plan additional queries based on gaps in current results."""
     model = get_model(ModelTier.LITE)
     existing = [r["query"] for r in state.get("search_results", [])]
+    feedback = state.get("quality_feedback", "")
 
     prompt = f"""I'm researching: "{state['topic']}" (mode: {state['mode']})
 
 Already searched:
 {chr(10).join(f'- {q}' for q in existing)}
 
-The current data is insufficient. Plan 3 additional search queries that:
+Quality feedback:
+{feedback or "The current data is insufficient."}
+
+Plan 3 additional search queries that:
 - Cover different angles than what we already have
 - Are more specific or targeted
 - Use different tools if possible
+- Directly address the quality feedback above
 
 Available tools: {[t.name for t in _tools]}
 
@@ -263,15 +462,16 @@ def synthesize_report(state: DeepResearchState) -> DeepResearchState:
     model = get_model(ModelTier.STANDARD)
     results = state.get("search_results", [])
 
-    # Build context from search results
-    context_parts = []
-    for i, r in enumerate(results, 1):
-        context_parts.append(f"[Source {i}: {r['source']}] Query: {r['query']}\n{r['content'][:2000]}")
-
-    context = "\n\n---\n\n".join(context_parts)
+    context = _build_research_context(results, max_chars=12000)
 
     # Load report format from skill definition
     mode = state.get("mode", "topic")
+    quality_score = state.get("quality_score", 0)
+    quality_feedback = state.get("quality_feedback", "")
+    quality_feedback_block = ""
+    if quality_feedback and quality_score < SELF_CORRECTION_SCORE:
+        quality_feedback_block = f"Structured feedback для self-correction:\n{quality_feedback}"
+
     from kronos.workspace import ws
     skill_path = str(ws.skill_path("deep-research"))
 
@@ -293,9 +493,14 @@ def synthesize_report(state: DeepResearchState) -> DeepResearchState:
 
 {context[:12000]}
 
+Оценка качества собранных данных: {quality_score}/100
+{quality_feedback_block}
+
 Правила:
 - Только факты с источниками. Не выдумывай.
 - Если данных нет — пиши "данных нет"
+- Если quality feedback указывает на пробелы — явно закрой их в отчёте или пометь как limitation.
+- При score ниже {SELF_CORRECTION_SCORE} сначала исправь слабые места: добавь caveats, missing evidence, risks, and next checks.
 - Начинай с TL;DR
 - Русский язык, термины на EN
 - Actionable recommendations в конце"""
@@ -307,4 +512,46 @@ def synthesize_report(state: DeepResearchState) -> DeepResearchState:
     return {
         "report": report,
         "messages": [AIMessage(content=report)],
+    }
+
+
+def self_correct_report(state: DeepResearchState) -> DeepResearchState:
+    """Rewrite the report once using judge feedback, without doing new search."""
+    report = state.get("report", "")
+    quality_feedback = state.get("quality_feedback", "")
+    correction_count = state.get("correction_count", 0)
+    if not report or not quality_feedback:
+        return {"correction_count": correction_count}
+
+    prompt = f"""Ты — Deep Research Agent. Улучши draft отчёта по feedback от quality judge.
+
+Оригинальная тема: {state.get("topic", "")}
+Режим: {state.get("mode", "topic")}
+Quality score: {state.get("quality_score", 0)}/100
+
+Judge feedback:
+{quality_feedback}
+
+Draft report:
+{report[:12000]}
+
+Правила:
+- Не добавляй факты, которых нет в draft или source-derived feedback.
+- Исправь слабые места, добавь limitations/caveats, риски и next checks.
+- Сохрани русский язык и структуру с TL;DR.
+- Верни только улучшенный отчёт."""
+
+    try:
+        model = get_model(ModelTier.STANDARD)
+        response = model.invoke([HumanMessage(content=prompt)])
+    except Exception as e:
+        log.warning("Self-correction failed, keeping draft report: %s", e)
+        return {"correction_count": correction_count}
+
+    corrected = response.content if isinstance(response.content, str) else str(response.content)
+    log.info("Report self-corrected: %d -> %d chars", len(report), len(corrected))
+    return {
+        "report": corrected,
+        "messages": [AIMessage(content=corrected)],
+        "correction_count": correction_count + 1,
     }

@@ -9,10 +9,16 @@ Security: generated code runs in a restricted scope (no file system
 access, no network, no imports beyond allowlist).
 """
 
+import ast
+import inspect
+import json
 import logging
 import re
+from dataclasses import dataclass
+from typing import Any
 
 from langchain_core.tools import BaseTool, StructuredTool
+from pydantic import Field, create_model
 
 from kronos.config import settings
 from kronos.llm import ModelTier, get_model
@@ -51,6 +57,22 @@ FORBIDDEN_PATTERNS = [
     r"shutil\.",
 ]
 
+PYTHON_TYPE_MAP = {
+    "str": str,
+    "int": int,
+    "float": float,
+    "bool": bool,
+    "list": list[Any],
+    "dict": dict[str, Any],
+}
+
+
+@dataclass(frozen=True)
+class ToolFunctionSpec:
+    name: str
+    description: str
+    args_schema: type
+
 GENERATE_PROMPT = """Create a Python function for a LangChain tool.
 
 Tool description: {description}
@@ -88,25 +110,152 @@ def validate_code(code: str) -> tuple[bool, str]:
         if re.search(pattern, code):
             return False, f"Forbidden pattern: {pattern}"
 
-    # Check imports
-    for match in re.finditer(r"^import\s+(\S+)|^from\s+(\S+)\s+import", code, re.MULTILINE):
-        module = match.group(1) or match.group(2)
-        base_module = module.split(".")[0]
-        if base_module not in SAFE_IMPORTS:
-            return False, f"Unsafe import: {module}"
-
-    # Must have exactly one function definition
-    func_defs = re.findall(r"^(?:async\s+)?def\s+(\w+)\s*\(", code, re.MULTILINE)
-    if len(func_defs) != 1:
-        return False, f"Expected 1 function, found {len(func_defs)}"
-
-    # Try to compile
     try:
-        compile(code, "<dynamic_tool>", "exec")
+        tree = ast.parse(code)
     except SyntaxError as e:
         return False, f"Syntax error: {e}"
 
+    func_defs: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                base_module = alias.name.split(".")[0]
+                if base_module not in SAFE_IMPORTS:
+                    return False, f"Unsafe import: {alias.name}"
+            continue
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            base_module = module.split(".")[0]
+            if base_module not in SAFE_IMPORTS:
+                return False, f"Unsafe import: {module}"
+            continue
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            continue
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            func_defs.append(node)
+            continue
+        return False, f"Top-level statements are not allowed: {type(node).__name__}"
+
+    if len(func_defs) != 1:
+        return False, f"Expected 1 function, found {len(func_defs)}"
+
+    func_def = func_defs[0]
+    if func_def.decorator_list:
+        return False, "Function decorators are not allowed"
+    if func_def.args.vararg or func_def.args.kwarg:
+        return False, "Variadic *args/**kwargs are not allowed"
+
+    for default in [*func_def.args.defaults, *[item for item in func_def.args.kw_defaults if item is not None]]:
+        try:
+            ast.literal_eval(default)
+        except (ValueError, TypeError):
+            return False, "Only literal argument defaults are allowed"
+
     return True, ""
+
+
+def _extract_function_spec(code: str, description: str) -> ToolFunctionSpec:
+    tree = ast.parse(code)
+    module_doc = ast.get_docstring(tree) or ""
+    func_def = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    )
+    docstring = ast.get_docstring(func_def) or module_doc or description
+    return ToolFunctionSpec(
+        name=func_def.name,
+        description=docstring,
+        args_schema=_build_args_schema(func_def.name, func_def),
+    )
+
+
+def _build_args_schema(name: str, func_def: ast.FunctionDef | ast.AsyncFunctionDef) -> type:
+    fields: dict[str, tuple[type, Any]] = {}
+
+    positional_args = [*func_def.args.posonlyargs, *func_def.args.args]
+    defaults = [None] * (len(positional_args) - len(func_def.args.defaults)) + list(func_def.args.defaults)
+    for arg, default_node in zip(positional_args, defaults, strict=True):
+        fields[arg.arg] = _field_for_arg(arg, default_node)
+
+    for arg, default_node in zip(func_def.args.kwonlyargs, func_def.args.kw_defaults, strict=True):
+        fields[arg.arg] = _field_for_arg(arg, default_node)
+
+    return create_model(f"{name}_Args", **fields)
+
+
+def _field_for_arg(arg: ast.arg, default_node: ast.expr | None) -> tuple[type, Any]:
+    annotation = _annotation_to_type(arg.annotation)
+    if default_node is None:
+        return annotation, Field(..., description=arg.arg)
+    default = ast.literal_eval(default_node)
+    if default is None:
+        annotation = Any
+    return annotation, Field(default, description=arg.arg)
+
+
+def _annotation_to_type(annotation: ast.expr | None) -> type:
+    if annotation is None:
+        return Any
+    if isinstance(annotation, ast.Name):
+        return PYTHON_TYPE_MAP.get(annotation.id, Any)
+    if isinstance(annotation, ast.Subscript) and isinstance(annotation.value, ast.Name):
+        return PYTHON_TYPE_MAP.get(annotation.value.id, Any)
+    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        return PYTHON_TYPE_MAP.get(annotation.value, Any)
+    return Any
+
+
+def _build_runner_code(code: str, func_name: str, args: tuple, kwargs: dict) -> str:
+    payload = json.dumps({"args": args, "kwargs": kwargs}, default=str)
+    return (
+        code
+        + "\n\nimport asyncio\n"
+        + "import inspect\n"
+        + "import json\n"
+        + f"_payload = json.loads({payload!r})\n"
+        + f"_result = {func_name}(*_payload['args'], **_payload['kwargs'])\n"
+        + "if inspect.isawaitable(_result):\n"
+        + "    _result = asyncio.run(_result)\n"
+        + "print(_result)\n"
+    )
+
+
+async def _run_locally_for_dev(code: str, func_name: str, args: tuple, kwargs: dict):
+    namespace: dict = {}
+    exec(code, namespace)  # noqa: S102
+    result = namespace[func_name](*args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+def _build_dynamic_tool(name: str, code: str, spec: ToolFunctionSpec) -> BaseTool:
+    async def _sandboxed_wrapper(*args, **kwargs):
+        """Execute the dynamic tool in a Docker sandbox."""
+        from kronos.tools.sandbox import execute_sandboxed, sandbox_ready
+
+        if sandbox_ready():
+            runner_code = _build_runner_code(code, spec.name, args, kwargs)
+            stdout, stderr = await execute_sandboxed(runner_code, timeout=30)
+            if stderr:
+                log.warning("Sandbox stderr for %s: %s", spec.name, stderr[:200])
+            return stdout or stderr or "No output"
+        if settings.require_dynamic_tool_sandbox:
+            from kronos.tools.sandbox import sandbox_unavailable_message
+
+            return f"Blocked: Docker sandbox is required for dynamic tools. {sandbox_unavailable_message()}"
+
+        return await _run_locally_for_dev(code, spec.name, args, kwargs)
+
+    _sandboxed_wrapper.__name__ = spec.name
+    _sandboxed_wrapper.__doc__ = spec.description
+
+    return StructuredTool.from_function(
+        coroutine=_sandboxed_wrapper,
+        name=name,
+        description=spec.description,
+        args_schema=spec.args_schema,
+    )
 
 
 async def create_tool(name: str, description: str) -> tuple[BaseTool | None, str]:
@@ -147,77 +296,21 @@ async def create_tool(name: str, description: str) -> tuple[BaseTool | None, str
     if not valid:
         return None, f"Generated code rejected: {reason}"
 
-    if settings.require_dynamic_tool_sandbox:
-        from kronos.tools.sandbox import _docker_available
+    spec = _extract_function_spec(code, description)
+    if spec.name != clean_name:
+        return None, f"Generated code rejected: function name must match tool name '{clean_name}'"
 
-        if not _docker_available():
+    if settings.require_dynamic_tool_sandbox:
+        from kronos.tools.sandbox import sandbox_ready, sandbox_unavailable_message
+
+        if not sandbox_ready():
             return None, (
                 "Docker sandbox is required before dynamic tools can be created. "
-                "Build the sandbox image or set REQUIRE_DYNAMIC_TOOL_SANDBOX=false for local development only."
+                f"{sandbox_unavailable_message()} "
+                "Set REQUIRE_DYNAMIC_TOOL_SANDBOX=false for local development only."
             )
 
-    # Execute in restricted namespace to extract function object for registration
-    namespace: dict = {}
-    try:
-        exec(code, namespace)  # noqa: S102
-    except Exception as e:
-        return None, f"Code execution failed: {e}"
-
-    # Find the function
-    func = None
-    for obj in namespace.values():
-        if callable(obj) and hasattr(obj, "__name__"):
-            func = obj
-            break
-
-    if not func:
-        return None, "No function found in generated code"
-
-    # Wrap function for sandboxed execution at runtime
-    _saved_code = code  # capture for sandbox closure
-    _func_name = func.__name__
-    _func_doc = func.__doc__ or description
-
-    async def _sandboxed_wrapper(*args, **kwargs):
-        """Execute the dynamic tool in a Docker sandbox."""
-        from kronos.tools.sandbox import _docker_available, execute_sandboxed
-
-        if _docker_available():
-            # Build a self-contained script that calls the function with given args
-            call_args = ", ".join(repr(a) for a in args)
-            call_kwargs = ", ".join(f"{k}={repr(v)}" for k, v in kwargs.items())
-            all_call_args = ", ".join(filter(None, [call_args, call_kwargs]))
-            runner_code = (
-                _saved_code
-                + f"\n\nimport asyncio\n"
-                f"result = asyncio.run({_func_name}({all_call_args})) "
-                f"if asyncio.iscoroutinefunction({_func_name}) "
-                f"else {_func_name}({all_call_args})\n"
-                f"print(result)"
-            )
-            stdout, stderr = await execute_sandboxed(runner_code, timeout=30)
-            if stderr:
-                log.warning("Sandbox stderr for %s: %s", _func_name, stderr[:200])
-            return stdout or stderr or "No output"
-        if settings.require_dynamic_tool_sandbox:
-            return (
-                "Blocked: Docker sandbox is required for dynamic tools. "
-                "Build the sandbox image or set REQUIRE_DYNAMIC_TOOL_SANDBOX=false for local development only."
-            )
-
-        if _is_async(func):
-            return await func(*args, **kwargs)
-        return func(*args, **kwargs)
-
-    _sandboxed_wrapper.__name__ = _func_name
-    _sandboxed_wrapper.__doc__ = _func_doc
-
-    # Wrap as LangChain tool using the sandboxed wrapper
-    tool = StructuredTool.from_function(
-        coroutine=_sandboxed_wrapper,
-        name=clean_name,
-        description=_func_doc,
-    )
+    tool = _build_dynamic_tool(clean_name, code, spec)
 
     # Persist
     _save_tool(clean_name, code, description)
@@ -232,10 +325,10 @@ def load_persisted_tools() -> list[BaseTool]:
         return []
 
     if settings.require_dynamic_tool_sandbox:
-        from kronos.tools.sandbox import _docker_available
+        from kronos.tools.sandbox import sandbox_ready, sandbox_unavailable_message
 
-        if not _docker_available():
-            log.warning("Skipping persisted dynamic tools: Docker sandbox is required but unavailable")
+        if not sandbox_ready():
+            log.warning("Skipping persisted dynamic tools: %s", sandbox_unavailable_message())
             return []
 
     if not TOOLS_DIR.exists():
@@ -250,62 +343,8 @@ def load_persisted_tools() -> list[BaseTool]:
                 log.warning("Skipping invalid persisted tool %s: %s", tool_file.name, reason)
                 continue
 
-            namespace: dict = {}
-            exec(code, namespace)  # noqa: S102
-
-            for obj in namespace.values():
-                if callable(obj) and hasattr(obj, "__name__") and obj.__name__ != "<module>":
-                    _persisted_code = code
-                    _persisted_name = obj.__name__
-                    _persisted_doc = obj.__doc__ or f"Dynamic tool: {obj.__name__}"
-                    _persisted_func = obj
-
-                    async def _persisted_sandbox_wrapper(
-                        *args,
-                        _code=_persisted_code,
-                        _name=_persisted_name,
-                        _func=_persisted_func,
-                        **kwargs,
-                    ):
-                        """Execute the persisted dynamic tool in a Docker sandbox."""
-                        from kronos.tools.sandbox import _docker_available, execute_sandboxed
-
-                        if _docker_available():
-                            call_args = ", ".join(repr(a) for a in args)
-                            call_kwargs = ", ".join(f"{k}={repr(v)}" for k, v in kwargs.items())
-                            all_call_args = ", ".join(filter(None, [call_args, call_kwargs]))
-                            runner_code = (
-                                _code
-                                + f"\n\nimport asyncio\n"
-                                f"result = asyncio.run({_name}({all_call_args})) "
-                                f"if asyncio.iscoroutinefunction({_name}) "
-                                f"else {_name}({all_call_args})\n"
-                                f"print(result)"
-                            )
-                            stdout, stderr = await execute_sandboxed(runner_code, timeout=30)
-                            if stderr:
-                                log.warning("Sandbox stderr for %s: %s", _name, stderr[:200])
-                            return stdout or stderr or "No output"
-                        if settings.require_dynamic_tool_sandbox:
-                            return (
-                                "Blocked: Docker sandbox is required for dynamic tools. "
-                                "Build the sandbox image or set REQUIRE_DYNAMIC_TOOL_SANDBOX=false for local development only."
-                            )
-
-                        if _is_async(_func):
-                            return await _func(*args, **kwargs)
-                        return _func(*args, **kwargs)
-
-                    _persisted_sandbox_wrapper.__name__ = _persisted_name
-                    _persisted_sandbox_wrapper.__doc__ = _persisted_doc
-
-                    tool = StructuredTool.from_function(
-                        coroutine=_persisted_sandbox_wrapper,
-                        name=_persisted_name,
-                        description=_persisted_doc,
-                    )
-                    tools.append(tool)
-                    break
+            spec = _extract_function_spec(code, f"Dynamic tool: {tool_file.stem}")
+            tools.append(_build_dynamic_tool(spec.name, code, spec))
 
         except Exception as e:
             log.error("Failed to load dynamic tool %s: %s", tool_file.name, e)
@@ -320,8 +359,3 @@ def _save_tool(name: str, code: str, description: str) -> None:
     path = TOOLS_DIR / f"{name}.py"
     header = f'"""{description}"""\n\n'
     path.write_text(header + code, encoding="utf-8")
-
-
-def _is_async(func) -> bool:
-    import inspect
-    return inspect.iscoroutinefunction(func)

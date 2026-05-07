@@ -39,3 +39,5 @@ class DeepResearchState(TypedDict):
     # Output
     report: str  # final structured report
     quality_score: int  # 0-100, self-assessed quality
+    quality_feedback: str  # structured gaps for search/synthesis correction
+    correction_count: int  # bounded self-correction attempts

@@ -3,7 +3,7 @@
 Pipeline:
   classify_mode → plan_queries → execute_searches → evaluate_quality
                                       ↑                    ↓
-                            plan_more_queries ← [need more?] → synthesize
+                            plan_more_queries ← [need more?] → synthesize → self-correct?
 
 No LangGraph — plain async workflow.
 """
@@ -19,8 +19,10 @@ from kronos.agents.deep_research.nodes import (
     execute_searches,
     plan_more_queries,
     plan_queries,
+    self_correct_report,
     set_tools,
     should_search_more,
+    should_self_correct,
     synthesize_report,
 )
 from kronos.agents.deep_research.state import DeepResearchState
@@ -48,6 +50,8 @@ def create_deep_research_agent(tools: list[BaseTool], on_tool_event=None):
             "iteration": 0,
             "report": "",
             "quality_score": 0,
+            "quality_feedback": "",
+            "correction_count": 0,
         }
 
         # Step 1: classify mode
@@ -77,6 +81,10 @@ def create_deep_research_agent(tools: list[BaseTool], on_tool_event=None):
         # Step 3: synthesize report
         update = synthesize_report(state)
         state.update(update)
+
+        if should_self_correct(state):
+            update = self_correct_report(state)
+            state.update(update)
 
         report = state.get("report", "")
         return AgentResult(

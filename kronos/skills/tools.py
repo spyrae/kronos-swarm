@@ -94,13 +94,8 @@ def approve_skill(skill_name: str) -> str:
     if skill.status != "draft":
         return f"Skill '{skill_name}' is already {skill.status}."
 
-    # Update frontmatter in file
-    raw = skill.path.read_text(encoding="utf-8")
-    updated = raw.replace("status: draft", "status: active")
-    skill.path.write_text(updated, encoding="utf-8")
-
-    # Update in-memory
-    skill.status = "active"
+    if not _store.update_status(skill_name, "active"):
+        return f"Skill '{skill_name}' could not be approved."
 
     log.info("Skill approved: %s", skill_name)
     return f"Skill '{skill_name}' одобрен и теперь активен."
@@ -111,7 +106,7 @@ def import_skill_from_source(source: str) -> str:
     """Import a skill from an external source (URL or GitHub).
 
     Fetches a remote SKILL.md, validates it, and registers the skill
-    in the local store. The skill becomes immediately available.
+    in the local store as a draft for review.
 
     Args:
         source: URL to a SKILL.md file, or 'github:user/repo/skill-name'

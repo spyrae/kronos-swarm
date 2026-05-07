@@ -15,6 +15,7 @@ from pathlib import Path
 from kronos.config import settings
 from kronos.cron.notify import TOPIC_GENERAL, send_bot_api
 from kronos.llm import ModelTier, get_model
+from kronos.skills.store import Skill
 
 log = logging.getLogger("kronos.cron.skill_improve")
 
@@ -32,12 +33,35 @@ SKILL_KEYWORDS = {
 }
 
 
-def _match_skill(text: str) -> str | None:
+def _tokenize_skill_text(text: str) -> set[str]:
+    import re
+
+    return {
+        token
+        for token in re.findall(r"[a-zA-Zа-яА-Я0-9]{4,}", text.lower())
+        if token not in {"skill", "auto", "created", "draft", "status"}
+    }
+
+
+def _match_skill(text: str, skills: list[Skill] | None = None) -> str | None:
     lower = text.lower()
     for skill, keywords in SKILL_KEYWORDS.items():
         if any(kw.lower() in lower for kw in keywords):
             return skill
-    return None
+    if not skills:
+        return None
+    text_tokens = _tokenize_skill_text(text)
+    if not text_tokens:
+        return None
+    best_name = None
+    best_score = 0
+    for skill in skills:
+        skill_tokens = _tokenize_skill_text(f"{skill.name} {skill.description}")
+        score = len(text_tokens & skill_tokens)
+        if score > best_score:
+            best_name = skill.name
+            best_score = score
+    return best_name if best_score >= 2 else None
 
 
 async def run_skill_improve() -> None:
@@ -48,6 +72,10 @@ async def run_skill_improve() -> None:
         return
 
     cutoff = time.time() - (LOOKBACK_DAYS * 86400)
+
+    from kronos.skills.store import SkillStore
+    skill_store = SkillStore(settings.workspace_path)
+    known_skills = skill_store.list_skills()
 
     # Collect interactions per skill
     skill_interactions: dict[str, list[dict]] = defaultdict(list)
@@ -62,7 +90,7 @@ async def run_skill_improve() -> None:
                     if dt.timestamp() < cutoff:
                         continue
                 inp = entry.get("input_preview", "")
-                skill = _match_skill(inp)
+                skill = _match_skill(inp, known_skills)
                 if skill:
                     skill_interactions[skill].append(entry)
             except (json.JSONDecodeError, ValueError):
@@ -84,7 +112,8 @@ async def run_skill_improve() -> None:
 
     for skill_name, interactions in candidates.items():
         from kronos.workspace import ws
-        skill_path = ws.skill_path(skill_name)
+        skill = skill_store.get(skill_name)
+        skill_path = skill.path if skill else ws.skill_path(skill_name)
         if not skill_path.exists():
             continue
 

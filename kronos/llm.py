@@ -17,11 +17,14 @@ import re
 import time
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 
 from kronos.config import settings
+from kronos.security.pii import mask_pii, mask_pii_object
 
 log = logging.getLogger("kronos.llm")
 
@@ -113,6 +116,56 @@ class _ProviderState:
 
 
 _state = _ProviderState()
+_callback_signature: tuple[str, bool, str] | None = None
+_callback_cache: list[BaseCallbackHandler] = []
+
+
+class _PIIMaskingCallbackHandler(BaseCallbackHandler):
+    """Forward LangChain callback events after masking PII payloads."""
+
+    def __init__(self, inner: BaseCallbackHandler):
+        super().__init__()
+        self._inner = inner
+
+    def _forward(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        method = getattr(self._inner, method_name, None)
+        if not method:
+            return None
+        masked_args = mask_pii_object(args)
+        masked_kwargs = mask_pii_object(kwargs)
+        return method(*masked_args, **masked_kwargs)
+
+    def on_llm_start(self, serialized: dict[str, Any], prompts: list[str], **kwargs: Any) -> Any:
+        return self._forward("on_llm_start", serialized, prompts, **kwargs)
+
+    def on_chat_model_start(
+        self,
+        serialized: dict[str, Any],
+        messages: list[list[BaseMessage]],
+        **kwargs: Any,
+    ) -> Any:
+        return self._forward("on_chat_model_start", serialized, messages, **kwargs)
+
+    def on_llm_end(self, response: Any, **kwargs: Any) -> Any:
+        return self._forward("on_llm_end", response, **kwargs)
+
+    def on_llm_error(self, error: BaseException, **kwargs: Any) -> Any:
+        return self._forward("on_llm_error", RuntimeError(mask_pii(str(error))), **kwargs)
+
+    def on_chain_start(self, serialized: dict[str, Any], inputs: dict[str, Any], **kwargs: Any) -> Any:
+        return self._forward("on_chain_start", serialized, inputs, **kwargs)
+
+    def on_chain_end(self, outputs: dict[str, Any], **kwargs: Any) -> Any:
+        return self._forward("on_chain_end", outputs, **kwargs)
+
+    def on_tool_start(self, serialized: dict[str, Any], input_str: str, **kwargs: Any) -> Any:
+        return self._forward("on_tool_start", serialized, input_str, **kwargs)
+
+    def on_tool_end(self, output: Any, **kwargs: Any) -> Any:
+        return self._forward("on_tool_end", output, **kwargs)
+
+    def on_text(self, text: str, **kwargs: Any) -> Any:
+        return self._forward("on_text", text, **kwargs)
 
 
 _PRESETS: dict[str, dict[str, object]] = {
@@ -361,8 +414,11 @@ def resolve_provider_config(provider: str) -> ProviderConfig | None:
 
 def reset_provider_state() -> None:
     """Clear cached model instances and cooldowns. Intended for tests."""
+    global _callback_cache, _callback_signature
     _state._cooldowns.clear()
     _state.clear_cache()
+    _callback_signature = None
+    _callback_cache = []
 
 
 def _has_key(provider: str) -> bool:
@@ -372,6 +428,7 @@ def _has_key(provider: str) -> bool:
 
 def _create_model(config: ProviderConfig) -> BaseChatModel | None:
     try:
+        callbacks = _observability_callbacks()
         if config.adapter in {"openai", "openai-compatible", "openai_compatible"}:
             from langchain_openai import ChatOpenAI
 
@@ -384,22 +441,60 @@ def _create_model(config: ProviderConfig) -> BaseChatModel | None:
             }
             if config.base_url:
                 kwargs["base_url"] = config.base_url
+            if callbacks:
+                kwargs["callbacks"] = callbacks
             return ChatOpenAI(**kwargs)
 
         if config.adapter == "deepseek":
             from langchain_deepseek import ChatDeepSeek
 
-            return ChatDeepSeek(
-                model=config.model,
-                api_key=config.api_key,
-                max_tokens=config.max_tokens,
-                temperature=config.temperature,
-            )
+            kwargs = {
+                "model": config.model,
+                "api_key": config.api_key,
+                "max_tokens": config.max_tokens,
+                "temperature": config.temperature,
+            }
+            if callbacks:
+                kwargs["callbacks"] = callbacks
+            return ChatDeepSeek(**kwargs)
 
         log.error("Unsupported LLM adapter '%s' for provider '%s'", config.adapter, config.provider_id)
     except Exception as e:
         log.error("Failed to create '%s' model: %s", config.provider_id, e)
     return None
+
+
+def _observability_callbacks() -> list[BaseCallbackHandler]:
+    """Create optional Langfuse callbacks with PII masking."""
+    global _callback_cache, _callback_signature
+    signature = (
+        settings.langfuse_public_key,
+        bool(settings.langfuse_secret_key),
+        settings.langfuse_host,
+    )
+    if signature == _callback_signature:
+        return _callback_cache
+
+    _callback_signature = signature
+    _callback_cache = []
+    if not settings.langfuse_public_key or not settings.langfuse_secret_key:
+        return _callback_cache
+
+    try:
+        from langfuse.callback import CallbackHandler
+
+        kwargs = {
+            "public_key": settings.langfuse_public_key,
+            "secret_key": settings.langfuse_secret_key,
+        }
+        if settings.langfuse_host:
+            kwargs["host"] = settings.langfuse_host
+        _callback_cache = [_PIIMaskingCallbackHandler(CallbackHandler(**kwargs))]
+    except Exception as e:
+        log.warning("Langfuse callback disabled: %s", e)
+        _callback_cache = []
+
+    return _callback_cache
 
 
 def _parse_chain(value: str) -> list[str]:

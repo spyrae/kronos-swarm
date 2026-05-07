@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     kaos_standard_provider_chain: str = "kimi,deepseek"
     kaos_lite_provider_chain: str = "deepseek,kimi"
+    kaos_vision_provider: str = "codex-cli"  # codex-cli | openai-api
+    kaos_vision_model: str = "gpt-5.2-codex"
+    kaos_codex_command: str = "codex"
+    kaos_vision_timeout_seconds: int = 120
 
     # Telegram Bridge
     tg_api_id: int = 0

@@ -2,7 +2,7 @@
 
 Three-Space layout:
   self/  → IDENTITY, SOUL, AGENTS (who I am)
-  notes/ → USER, MEMORY (what I know)
+  notes/ → USER, MEMORY, USER-MODEL (what I know)
   ops/   → TOOLS, WORKFLOW_AUTO (what I do)
 
 Skills are loaded via SkillStore with progressive disclosure:
@@ -19,6 +19,7 @@ log = logging.getLogger("kronos.persona")
 
 # Core persona file attribute names on Workspace, loaded in order
 _CORE_ATTRS = ["identity", "soul", "user", "tools", "agents", "workflow"]
+MAX_USER_MODEL_CHARS = 6000
 
 
 def load_persona(workspace_path: str | None = None) -> str:
@@ -52,6 +53,18 @@ def load_memory(workspace_path: str | None = None) -> str:
     return ""
 
 
+def load_user_model(workspace_path: str | None = None) -> str:
+    """Load dialectic USER-MODEL.md context."""
+    ws = _workspace.ws
+    if ws.user_model.is_file():
+        content = ws.user_model.read_text(encoding="utf-8").strip()
+        if len(content) > MAX_USER_MODEL_CHARS:
+            content = content[:MAX_USER_MODEL_CHARS].rstrip() + "\n\n[User model truncated]"
+        log.info("Loaded user model: %d chars", len(content))
+        return content
+    return ""
+
+
 def load_handoff(workspace_path: str | None = None) -> str:
     """Load handoff.md for session continuity after compaction/restart."""
     ws = _workspace.ws
@@ -79,8 +92,9 @@ def build_system_prompt(workspace_path: str | None = None, skill_catalog: str = 
     # 2. Persona files
     persona = load_persona()
 
-    # 3. Memory
+    # 3. Memory and dialectic user model
     memory = load_memory()
+    user_model = load_user_model()
 
     sections = []
 
@@ -91,6 +105,9 @@ def build_system_prompt(workspace_path: str | None = None, skill_catalog: str = 
 
     if memory:
         sections.append(f"# Long-term Memory\n\n{memory}")
+
+    if user_model:
+        sections.append(f"# Dialectic User Model\n\n{user_model}")
 
     if skill_catalog:
         sections.append(

@@ -64,6 +64,48 @@ def test_skill_packs_list_show_and_dry_run(capsys):
     assert not (ROOT / "workspaces" / "template-smoke-agent").exists()
 
 
+def test_skills_import_and_export_cli(tmp_path, monkeypatch, capsys):
+    import kronos.cli as cli
+    from kronos.skills import hub
+
+    skill_md = """---
+name: external-cli
+description: External CLI skill
+version: 1.2.3
+author: Ada
+---
+# External CLI
+
+Follow the reviewed protocol.
+"""
+    monkeypatch.setattr(cli, "_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(hub, "_fetch_url", lambda _url: skill_md)
+
+    result = main(["skills", "import", "https://example.com/SKILL.md", "--agent", "hub-agent"])
+    out = capsys.readouterr().out
+
+    assert result == 0
+    assert "imported successfully as draft" in out
+    skill_file = tmp_path / "workspaces" / "hub-agent" / "self" / "skills" / "external-cli" / "SKILL.md"
+    assert "status: draft" in skill_file.read_text(encoding="utf-8")
+
+    export_path = tmp_path / "exported" / "SKILL.md"
+    result = main([
+        "skills",
+        "export",
+        "external-cli",
+        "--agent",
+        "hub-agent",
+        "--output",
+        str(export_path),
+    ])
+    out = capsys.readouterr().out
+
+    assert result == 0
+    assert "Exported skill 'external-cli'" in out
+    assert "# External CLI" in export_path.read_text(encoding="utf-8")
+
+
 def test_bundled_templates_and_packs_have_required_metadata():
     agent_templates = sorted((ROOT / "templates" / "agents").glob("*/template.yaml"))
     skill_packs = sorted((ROOT / "templates" / "skill-packs").glob("*/pack.yaml"))

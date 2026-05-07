@@ -8,12 +8,14 @@ import asyncio
 import logging
 import os
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
 log = logging.getLogger("kronos.tools.sandbox")
 
 SANDBOX_IMAGE = "kronos-sandbox:latest"
+SANDBOX_BUILD_SCRIPT = "scripts/build-sandbox.sh"
 DEFAULT_TIMEOUT = 30
 DEFAULT_MEMORY = "256m"
 
@@ -21,6 +23,74 @@ DEFAULT_MEMORY = "256m"
 def _docker_available() -> bool:
     """Check if Docker is available."""
     return shutil.which("docker") is not None
+
+
+def _docker_image_available(image: str = SANDBOX_IMAGE) -> bool:
+    """Check if the sandbox image exists locally."""
+    if not _docker_available():
+        return False
+
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", image],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def sandbox_ready() -> bool:
+    """Return whether Docker and the local sandbox image are ready."""
+    return _docker_available() and _docker_image_available()
+
+
+def sandbox_status() -> dict[str, object]:
+    """Return operator-facing sandbox readiness details."""
+    docker_available = _docker_available()
+    return {
+        "docker_available": docker_available,
+        "image": SANDBOX_IMAGE,
+        "image_available": _docker_image_available() if docker_available else False,
+        "build_script": SANDBOX_BUILD_SCRIPT,
+    }
+
+
+def sandbox_unavailable_message() -> str:
+    """Return a concise remediation hint for sandbox setup."""
+    status = sandbox_status()
+    if not status["docker_available"]:
+        return "Docker is required for dynamic tool sandboxing."
+    return f"Sandbox image {SANDBOX_IMAGE} is missing. Run `{SANDBOX_BUILD_SCRIPT}`."
+
+
+def build_sandbox_command(
+    tmpdir: str,
+    memory_limit: str = DEFAULT_MEMORY,
+    network: bool = False,
+) -> list[str]:
+    """Build the Docker command for a single sandboxed execution."""
+    network_flag = "bridge" if network else "none"
+    return [
+        "docker", "run",
+        "--rm",
+        f"--memory={memory_limit}",
+        f"--network={network_flag}",
+        "--cpus=1",
+        "--pids-limit=50",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m",
+        "--security-opt=no-new-privileges",
+        "--user=10001:10001",
+        "--workdir=/code",
+        "-v", f"{tmpdir}:/code:ro",
+        SANDBOX_IMAGE,
+        "python", "/sandbox/runner.py",
+    ]
 
 
 async def execute_sandboxed(
@@ -40,13 +110,20 @@ async def execute_sandboxed(
     Returns:
         Tuple of (stdout, stderr)
     """
-    if not _docker_available():
-        from kronos.config import settings
+    from kronos.config import settings
 
+    if not _docker_available():
         if settings.require_dynamic_tool_sandbox:
             return "", "Sandbox unavailable: Docker is required for dynamic tool execution."
 
         log.warning("Docker not available, falling back to in-process exec")
+        return _exec_in_process(code, timeout)
+
+    if not _docker_image_available():
+        if settings.require_dynamic_tool_sandbox:
+            return "", f"Sandbox unavailable: {sandbox_unavailable_message()}"
+
+        log.warning("Docker sandbox image not available, falling back to in-process exec")
         return _exec_in_process(code, timeout)
 
     tmpdir = None
@@ -55,22 +132,7 @@ async def execute_sandboxed(
         code_file = Path(tmpdir) / "tool.py"
         code_file.write_text(code, encoding="utf-8")
 
-        network_flag = "bridge" if network else "none"
-
-        cmd = [
-            "docker", "run",
-            "--rm",
-            f"--memory={memory_limit}",
-            f"--network={network_flag}",
-            "--cpus=1",
-            "--pids-limit=50",
-            "--read-only",
-            "--tmpfs=/tmp:size=64m",
-            "--security-opt=no-new-privileges",
-            "-v", f"{tmpdir}:/code:ro",
-            SANDBOX_IMAGE,
-            "python", "/code/tool.py",
-        ]
+        cmd = build_sandbox_command(tmpdir, memory_limit=memory_limit, network=network)
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,

@@ -20,6 +20,8 @@ from typing import Any
 from kronos import __version__
 from kronos.config import settings
 from kronos.llm import ModelTier, describe_provider_chain, is_runtime_llm_configured
+from kronos.logging import install_pii_filter
+from kronos.security.pii import mask_pii
 
 log = logging.getLogger("kronos.cli")
 
@@ -29,6 +31,7 @@ def _configure_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    install_pii_filter()
 
 
 def _runtime_llm_configured() -> bool:
@@ -56,7 +59,8 @@ def _redact_tool_payload(value: Any, key: str = "") -> Any:
     if isinstance(value, tuple):
         return [_redact_tool_payload(item) for item in value[:10]]
     if isinstance(value, str):
-        return value if len(value) <= 160 else f"{value[:157]}..."
+        redacted = mask_pii(value)
+        return redacted if len(redacted) <= 160 else f"{redacted[:157]}..."
     return value
 
 
@@ -345,8 +349,19 @@ def run_doctor() -> int:
         warn("Data path", f"Parent directory does not exist yet: {db_dir.parent}")
 
     if settings.enable_dynamic_tools:
-        if settings.require_dynamic_tool_sandbox and not shutil.which("docker"):
-            fail("Dynamic tools", "ENABLE_DYNAMIC_TOOLS=true but Docker sandbox is unavailable")
+        if settings.require_dynamic_tool_sandbox:
+            from kronos.tools.sandbox import sandbox_status
+
+            status = sandbox_status()
+            if not status["docker_available"]:
+                fail("Dynamic tools", "ENABLE_DYNAMIC_TOOLS=true but Docker is unavailable")
+            elif not status["image_available"]:
+                fail(
+                    "Dynamic tools",
+                    f"ENABLE_DYNAMIC_TOOLS=true but sandbox image is missing; run {status['build_script']}",
+                )
+            else:
+                warn("Dynamic tools", f"Enabled with required sandbox image {status['image']}")
         else:
             warn("Dynamic tools", "Enabled; keep this only for trusted local deployments")
     else:
@@ -509,7 +524,24 @@ def _skill_pack_dir(name: str) -> Path:
     return _repo_root() / "templates" / "skill-packs" / name
 
 
-def run_skills(command: str, pack: str = "", agent: str = "", force: bool = False, dry_run: bool = False) -> int:
+def _skills_workspace_root(agent: str = "") -> Path:
+    if agent:
+        return _repo_root() / "workspaces" / _agent_slug(agent)
+    if settings.workspace_path:
+        return Path(settings.workspace_path)
+    return _repo_root() / "workspaces" / _agent_slug(settings.agent_name)
+
+
+def run_skills(
+    command: str,
+    pack: str = "",
+    agent: str = "",
+    force: bool = False,
+    dry_run: bool = False,
+    source: str = "",
+    skill: str = "",
+    output: str = "",
+) -> int:
     if command == "packs":
         packs = _available_skill_packs()
         if not packs:
@@ -522,6 +554,36 @@ def run_skills(command: str, pack: str = "", agent: str = "", force: bool = Fals
         print("\nNext:")
         print("  kaos skills show-pack productivity")
         print("  kaos skills install-pack productivity --agent personal-demo --force")
+        return 0
+
+    if command == "import":
+        from kronos.skills.hub import import_skill
+        from kronos.skills.store import SkillStore
+
+        workspace_root = _skills_workspace_root(agent)
+        store = SkillStore(str(workspace_root))
+        print(f"Importing skill into {workspace_root / 'self' / 'skills'}")
+        result = import_skill(source, store)
+        print(result)
+        return 0 if "imported successfully" in result else 1
+
+    if command == "export":
+        from kronos.skills.hub import export_skill
+        from kronos.skills.store import SkillStore
+
+        workspace_root = _skills_workspace_root(agent)
+        store = SkillStore(str(workspace_root))
+        content = export_skill(skill, store)
+        if content is None:
+            print(f"Skill '{skill}' not found in {workspace_root / 'self' / 'skills'}")
+            return 1
+        if output:
+            out_path = Path(output)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(content, encoding="utf-8")
+            print(f"Exported skill '{skill}' to {out_path}")
+        else:
+            print(content)
         return 0
 
     pack_dir = _skill_pack_dir(pack)
@@ -705,6 +767,17 @@ def run_demo_seed(data_dir: str, workspace: str, swarm_db: str, reset: bool) -> 
     return 0
 
 
+async def _run_sessions_backfill_search(agent: str = "") -> int:
+    """Backfill existing persisted sessions into the shared FTS search index."""
+    from kronos.session import SessionStore
+
+    target_agent = agent or settings.agent_name
+    store = SessionStore(settings.db_path, agent_name=target_agent)
+    indexed = await store.backfill_swarm_fts()
+    print(f"Session search backfill complete: {indexed} new messages indexed for agent '{target_agent}'.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="kaos",
@@ -744,6 +817,13 @@ def build_parser() -> argparse.ArgumentParser:
     skill_install.add_argument("--agent", default="", help="target AGENT_NAME/workspace; defaults to current settings")
     skill_install.add_argument("--force", action="store_true", help="overwrite existing skills")
     skill_install.add_argument("--dry-run", action="store_true", help="show what would be installed")
+    skill_import = skills_sub.add_parser("import", help="import an external SKILL.md as a draft")
+    skill_import.add_argument("source", help="URL to SKILL.md or github:user/repo/skill-name")
+    skill_import.add_argument("--agent", default="", help="target AGENT_NAME/workspace; defaults to current settings")
+    skill_export = skills_sub.add_parser("export", help="export a local skill as SKILL.md")
+    skill_export.add_argument("skill")
+    skill_export.add_argument("--agent", default="", help="source AGENT_NAME/workspace; defaults to current settings")
+    skill_export.add_argument("--output", "-o", default="", help="write to file instead of stdout")
 
     chat = sub.add_parser("chat", help="start local CLI chat")
     chat.add_argument("--tools", action="store_true", help="load configured static MCP tools")
@@ -760,6 +840,11 @@ def build_parser() -> argparse.ArgumentParser:
     demo_seed.add_argument("--workspace", default="workspaces/demo", help="target demo workspace")
     demo_seed.add_argument("--swarm-db", default="data/demo/swarm.db", help="target demo swarm database")
     demo_seed.add_argument("--reset", action="store_true", help="delete existing demo data before seeding")
+
+    sessions = sub.add_parser("sessions", help="maintain local session history")
+    sessions_sub = sessions.add_subparsers(dest="sessions_command")
+    sessions_backfill = sessions_sub.add_parser("backfill-search", help="backfill existing sessions into session_search")
+    sessions_backfill.add_argument("--agent", default="", help="agent name to index under; defaults to AGENT_NAME")
 
     connect = sub.add_parser("connect", help="guided connector setup")
     connect_sub = connect.add_subparsers(dest="connector")
@@ -814,6 +899,10 @@ def main(argv: list[str] | None = None) -> int:
                 force=args.force,
                 dry_run=args.dry_run,
             )
+        if args.skills_command == "import":
+            return run_skills("import", source=args.source, agent=args.agent)
+        if args.skills_command == "export":
+            return run_skills("export", skill=args.skill, agent=args.agent, output=args.output)
         parser.parse_args(["skills", "--help"])
         return 0
     if args.command == "chat":
@@ -822,6 +911,11 @@ def main(argv: list[str] | None = None) -> int:
         return run_demo(interactive=args.interactive, live=args.live, use_tools=args.tools)
     if args.command == "demo-seed":
         return run_demo_seed(args.data_dir, args.workspace, args.swarm_db, reset=args.reset)
+    if args.command == "sessions":
+        if args.sessions_command == "backfill-search":
+            return asyncio.run(_run_sessions_backfill_search(agent=args.agent))
+        parser.parse_args(["sessions", "--help"])
+        return 0
     if args.command == "connect":
         if args.connector == "telegram":
             return run_connect_telegram()

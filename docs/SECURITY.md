@@ -17,13 +17,21 @@ These defaults mean a fresh clone can run local chat/demo flows without allowing
 
 Telegram DMs are blocked until `ALLOWED_USERS` is configured, unless `ALLOW_ALL_USERS=true` is set explicitly.
 
+Dynamic tools require the local Docker sandbox image when `REQUIRE_DYNAMIC_TOOL_SANDBOX=true`. Build it with `scripts/build-sandbox.sh`; `kaos doctor` fails closed if dynamic tools are enabled but Docker or the image is missing.
+
 ## Tool-Call Audit Trail
 
 Every ReAct tool lifecycle event is persisted to `data/<agent>/logs/tool_calls.jsonl`.
 
 Stored fields include timestamp, event phase (`tool_call` / `tool_result`), session/thread/user context, tool name, inferred capability, approval status, redacted args summary, redacted result summary, error flag, and latency. The dashboard reads this file through `/api/audit-trail/tool-calls` and supports filtering by session, tool, status, and capability.
 
-Raw tool payloads are not stored. Secret-like keys (`token`, `secret`, `password`, `api_key`, `authorization`, and suffix variants) are replaced with `***REDACTED***`; bearer tokens, `sk-*` keys, and URL query tokens are redacted inside strings before storage.
+Raw tool payloads are not stored. Secret-like keys (`token`, `secret`, `password`, `api_key`, `authorization`, and suffix variants) are replaced with `***REDACTED***`; bearer tokens, `sk-*` keys, URL query tokens, and baseline PII patterns are redacted inside strings before storage.
+
+## PII Masking For Observability
+
+`kronos/security/pii.py` masks common PII before data reaches logs, audit previews, tool summaries, dashboard log streaming, Langfuse callbacks, or memory metadata. The runtime masks email addresses, RU/INT phone numbers, card numbers, Russian passport numbers, and IPv4 addresses.
+
+PII masking is intentionally scoped to observability surfaces. User-facing replies, agent working context, and memory content are not modified, so the agent can still use the data needed to answer correctly. Personal names are not masked because regex-based name detection creates too many false positives and would hurt personalization.
 
 ## Capability Approvals
 

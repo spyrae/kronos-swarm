@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from kronos.config import settings
+from kronos.security.pii import mask_pii
 
 log = logging.getLogger("kronos.audit")
 
@@ -65,6 +66,7 @@ def _redact_string(value: str, *, max_len: int = 500) -> str:
     redacted = value
     for pattern, replacement in _SECRET_PATTERNS:
         redacted = pattern.sub(replacement, redacted)
+    redacted = mask_pii(redacted)
     if len(redacted) > max_len:
         return f"{redacted[:max_len - 3]}..."
     return redacted
@@ -203,8 +205,8 @@ def log_request(
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "approx_cost_usd": round(approx_cost, 6),
-            "input_preview": input_text[:100],
-            "output_preview": output_text[:100],
+            "input_preview": mask_pii(input_text)[:100],
+            "output_preview": mask_pii(output_text)[:100],
         }
 
         with open(audit_dir / "audit.jsonl", "a") as f:

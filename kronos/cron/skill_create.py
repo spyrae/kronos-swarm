@@ -3,6 +3,7 @@
 Called by self_improve as a second analysis phase.
 """
 
+import hashlib
 import json
 import logging
 import re
@@ -20,6 +21,7 @@ log = logging.getLogger("kronos.cron.skill_create")
 LOOKBACK_DAYS = 7
 MIN_TOOL_CALLS = 5
 MIN_SUPERVISOR_STEPS = 3
+_SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$")
 
 
 def _load_recent_audit_entries(lookback_days: int = LOOKBACK_DAYS) -> list[dict]:
@@ -64,6 +66,56 @@ def _simple_token_overlap(text1: str, text2: str) -> float:
     return len(intersection) / min(len(tokens1), len(tokens2))
 
 
+def _entry_session_ref(entry: dict, index: int) -> str:
+    """Return a stable audit/session reference for skill provenance."""
+    for key in ("session_id", "thread_id", "id"):
+        value = str(entry.get(key, "")).strip()
+        if value:
+            return value
+    ts = str(entry.get("ts", "")).strip()
+    preview = str(entry.get("input_preview", ""))[:80]
+    digest = hashlib.sha256(f"{ts}\0{preview}\0{index}".encode()).hexdigest()[:12]
+    return f"audit-{digest}"
+
+
+def _normalize_skill_name(name: str) -> str:
+    """Normalize a model-proposed skill name into safe kebab-case."""
+    normalized = re.sub(r"[^a-z0-9-]+", "-", name.strip().lower())
+    normalized = re.sub(r"-+", "-", normalized).strip("-")
+    if not _SKILL_NAME_RE.match(normalized):
+        return ""
+    return normalized
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Extract the first JSON object from plain text or markdown fences."""
+    decoder = json.JSONDecoder()
+    for idx, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            data, _ = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _normalize_tools(value) -> list[str]:
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    return []
+
+
+def _normalize_protocol(value) -> str:
+    if isinstance(value, list):
+        return "\n".join(f"{idx}. {item}" for idx, item in enumerate(value, start=1))
+    return str(value or "").strip()
+
+
 async def analyze_for_new_skills(entries: list[dict] | None = None) -> str | None:
     """Analyze recent sessions for repeatable patterns that could become skills.
 
@@ -81,14 +133,19 @@ async def analyze_for_new_skills(entries: list[dict] | None = None) -> str | Non
         return None
 
     # Build session summaries for LLM
+    session_refs = []
+    examples = []
     summaries = []
-    for e in complex_sessions[-10:]:
+    for idx, e in enumerate(complex_sessions[-10:], start=1):
+        ref = _entry_session_ref(e, idx)
+        session_refs.append(ref)
         inp = e.get("input_preview", "")[:150]
         out = e.get("output_preview", "")[:100]
         tools = e.get("tool_calls_count", 0)
         steps = e.get("supervisor_steps", 0)
+        examples.append(f"- {ref}: {inp}")
         summaries.append(
-            f"[tools={tools}, steps={steps}] User: {inp} → Agent: {out}"
+            f"[ref={ref}, tools={tools}, steps={steps}] User: {inp} → Agent: {out}"
         )
 
     sessions_text = "\n".join(summaries)
@@ -138,24 +195,18 @@ async def analyze_for_new_skills(entries: list[dict] | None = None) -> str | Non
         response.content if isinstance(response.content, str) else str(response.content)
     )
 
-    # Parse JSON from response
-    try:
-        # Extract JSON from possible markdown
-        json_match = re.search(r"\{[^{}]*\"found\"[^{}]*\}", reply, re.DOTALL)
-        if not json_match:
-            log.info("No JSON found in skill analysis response")
-            return None
-        data = json.loads(json_match.group())
-    except (json.JSONDecodeError, AttributeError):
-        log.warning("Failed to parse skill analysis response")
+    data = _extract_json_object(reply)
+    if not data:
+        log.info("No JSON object found in skill analysis response")
         return None
 
     if not data.get("found"):
         log.info("No repeatable patterns found for skill creation")
         return None
 
-    name = data.get("name", "").strip()
+    name = _normalize_skill_name(data.get("name", ""))
     if not name:
+        log.info("Skill analysis returned invalid skill name: %r", data.get("name", ""))
         return None
 
     # Dedup check: fuzzy match against existing skills
@@ -175,9 +226,9 @@ async def analyze_for_new_skills(entries: list[dict] | None = None) -> str | Non
 
     # Create draft skill
     now = datetime.now(UTC).isoformat()
-    protocol = data.get("protocol", "")
+    protocol = _normalize_protocol(data.get("protocol", ""))
     trigger = data.get("trigger", "")
-    tools_list = data.get("tools", [])
+    tools_list = _normalize_tools(data.get("tools", []))
     description = data.get("description", "")
 
     content = f"""# {name}
@@ -189,7 +240,15 @@ async def analyze_for_new_skills(entries: list[dict] | None = None) -> str | Non
 {protocol}
 
 ## Tools
-{', '.join(tools_list) if tools_list else 'N/A'}
+{chr(10).join(f"- {tool}" for tool in tools_list) if tools_list else "N/A"}
+
+## Examples
+{chr(10).join(examples[:5])}
+
+## Meta
+- status: draft
+- created_by: auto
+- created_from_sessions: {", ".join(session_refs)}
 """
 
     meta = {
@@ -197,8 +256,13 @@ async def analyze_for_new_skills(entries: list[dict] | None = None) -> str | Non
         "description": description,
         "status": "draft",
         "created_by": "auto",
+        "created_from_sessions": json.dumps(session_refs, ensure_ascii=False),
         "created_at": now,
-        "version": "1",
+        "version": "1.0.0",
+        "author": "kaos",
+        "tags": "[auto-created, self-improvement]",
+        "tools": json.dumps(tools_list, ensure_ascii=False),
+        "review_required": "true",
     }
 
     skill_store.add_skill(name, content, meta)

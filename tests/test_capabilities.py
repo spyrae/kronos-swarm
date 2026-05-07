@@ -71,3 +71,104 @@ async def test_dynamic_tool_sandbox_fails_closed(monkeypatch):
 
     assert stdout == ""
     assert "Docker is required" in stderr
+
+
+@pytest.mark.asyncio
+async def test_dynamic_tool_sandbox_fails_closed_without_image(monkeypatch):
+    from kronos.tools import sandbox
+
+    monkeypatch.setattr(settings, "require_dynamic_tool_sandbox", True)
+    monkeypatch.setattr(sandbox, "_docker_available", lambda: True)
+    monkeypatch.setattr(sandbox, "_docker_image_available", lambda image=sandbox.SANDBOX_IMAGE: False)
+
+    stdout, stderr = await sandbox.execute_sandboxed("print('unsafe')")
+
+    assert stdout == ""
+    assert "sandbox image" in stderr.lower()
+
+
+def test_sandbox_command_uses_restrictive_docker_flags():
+    from kronos.tools import sandbox
+
+    cmd = sandbox.build_sandbox_command("/tmp/kronos-sandbox-test", memory_limit="128m")
+
+    assert "--network=none" in cmd
+    assert "--read-only" in cmd
+    assert "--cap-drop=ALL" in cmd
+    assert "--security-opt=no-new-privileges" in cmd
+    assert "--pids-limit=50" in cmd
+    assert "--user=10001:10001" in cmd
+    assert "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m" in cmd
+    assert "kronos-sandbox:latest" in cmd
+    assert cmd[-2:] == ["python", "/sandbox/runner.py"]
+
+
+def test_dynamic_tool_validation_rejects_top_level_execution():
+    from kronos.tools.dynamic import validate_code
+
+    valid, reason = validate_code(
+        "print('side effect')\n\n"
+        "async def sample_tool() -> str:\n"
+        "    return 'ok'\n"
+    )
+
+    assert valid is False
+    assert "Top-level statements" in reason
+
+
+@pytest.mark.asyncio
+async def test_dynamic_tool_creation_requires_ready_sandbox_image(monkeypatch):
+    from kronos.tools import dynamic, sandbox
+
+    class FakeModel:
+        def invoke(self, _messages):
+            return type("Response", (), {
+                "content": (
+                    "async def hello_tool(name: str) -> str:\n"
+                    "    \"\"\"Say hello.\"\"\"\n"
+                    "    return f'hello {name}'\n"
+                )
+            })()
+
+    monkeypatch.setattr(settings, "enable_dynamic_tools", True)
+    monkeypatch.setattr(settings, "require_dynamic_tool_sandbox", True)
+    monkeypatch.setattr(dynamic, "get_model", lambda _tier: FakeModel())
+    monkeypatch.setattr(sandbox, "sandbox_ready", lambda: False)
+    monkeypatch.setattr(
+        sandbox,
+        "sandbox_unavailable_message",
+        lambda: "Sandbox image kronos-sandbox:latest is missing. Run `scripts/build-sandbox.sh`.",
+    )
+
+    tool, message = await dynamic.create_tool("hello_tool", "Say hello")
+
+    assert tool is None
+    assert "sandbox image" in message.lower()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_tool_can_register_from_ast_metadata_without_required_sandbox(monkeypatch, tmp_path):
+    from kronos.tools import dynamic, sandbox
+
+    class FakeModel:
+        def invoke(self, _messages):
+            return type("Response", (), {
+                "content": (
+                    "async def hello_tool(name: str) -> str:\n"
+                    "    \"\"\"Say hello.\"\"\"\n"
+                    "    return f'hello {name}'\n"
+                )
+            })()
+
+    monkeypatch.setattr(settings, "enable_dynamic_tools", True)
+    monkeypatch.setattr(settings, "require_dynamic_tool_sandbox", False)
+    monkeypatch.setattr(dynamic, "TOOLS_DIR", tmp_path)
+    monkeypatch.setattr(dynamic, "get_model", lambda _tier: FakeModel())
+    monkeypatch.setattr(sandbox, "sandbox_ready", lambda: False)
+
+    tool, message = await dynamic.create_tool("hello_tool", "Say hello")
+
+    assert tool is not None
+    assert "created successfully" in message
+    assert await tool.ainvoke({"name": "Ada"}) == "hello Ada"
+    assert (tmp_path / "hello_tool.py").exists()

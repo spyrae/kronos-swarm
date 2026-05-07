@@ -103,6 +103,35 @@ def test_doctor_allows_fresh_clone_before_workspace_init(monkeypatch, tmp_path, 
     assert "No hard blockers found." in out
 
 
+def test_doctor_fails_when_dynamic_tools_enabled_without_sandbox_image(monkeypatch, tmp_path, capsys):
+    from kronos.tools import sandbox
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='fresh-kaos'\n", encoding="utf-8")
+    monkeypatch.setattr(settings, "agent_name", "kronos")
+    monkeypatch.setattr(settings, "workspace_path", "")
+    monkeypatch.setattr(settings, "db_dir", "data/kronos")
+    monkeypatch.setattr(settings, "enable_dynamic_tools", True)
+    monkeypatch.setattr(settings, "require_dynamic_tool_sandbox", True)
+    monkeypatch.setattr(settings, "enable_mcp_gateway_management", False)
+    monkeypatch.setattr(settings, "enable_dynamic_mcp_servers", False)
+    monkeypatch.setattr(settings, "enable_server_ops", False)
+    monkeypatch.setattr(settings, "allowed_users", "")
+    monkeypatch.setattr(settings, "allow_all_users", False)
+    monkeypatch.setattr(sandbox, "sandbox_status", lambda: {
+        "docker_available": True,
+        "image": "kronos-sandbox:latest",
+        "image_available": False,
+        "build_script": "scripts/build-sandbox.sh",
+    })
+
+    result = main(["doctor"])
+
+    out = capsys.readouterr().out
+    assert result == 1
+    assert "sandbox image is missing; run scripts/build-sandbox.sh" in out
+
+
 def test_tool_event_printer_redacts_secret_args(capsys):
     from kronos.cli import _make_tool_event_printer
 
@@ -142,6 +171,26 @@ def test_dashboard_command_routes_to_runner(monkeypatch, capsys):
     monkeypatch.setattr(cli, "run_dashboard_command", fake_dashboard)
 
     result = cli.main(["dashboard"])
+
+    capsys.readouterr()
+    assert result == 0
+    assert called is True
+
+
+def test_sessions_backfill_command_routes_to_runner(monkeypatch, capsys):
+    import kronos.cli as cli
+
+    called = False
+
+    async def fake_backfill(agent: str = ""):
+        nonlocal called
+        called = True
+        assert agent == "kronos"
+        return 0
+
+    monkeypatch.setattr(cli, "_run_sessions_backfill_search", fake_backfill)
+
+    result = cli.main(["sessions", "backfill-search", "--agent", "kronos"])
 
     capsys.readouterr()
     assert result == 0

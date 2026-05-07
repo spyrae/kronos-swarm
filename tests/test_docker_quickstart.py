@@ -84,3 +84,20 @@ def test_dockerignore_excludes_private_runtime_state_but_keeps_template():
     assert "data/" in dockerignore
     assert "workspaces/*" in dockerignore
     assert "!workspaces/_template/**" in dockerignore
+
+
+def test_sandbox_dockerfile_uses_non_root_pure_python_runner():
+    text = (ROOT / "docker/sandbox/Dockerfile").read_text(encoding="utf-8")
+
+    assert "PIP_NO_INDEX=1" in text
+    assert "RUN pip install" not in text
+    assert "USER 10001:10001" in text
+    assert "COPY runner.py /sandbox/runner.py" in text
+    assert 'CMD ["python", "/sandbox/runner.py"]' in text
+
+
+def test_sandbox_build_script_allows_image_name_override():
+    text = (ROOT / "scripts/build-sandbox.sh").read_text(encoding="utf-8")
+
+    assert 'IMAGE_NAME="${SANDBOX_IMAGE:-kronos-sandbox:latest}"' in text
+    assert 'docker build -t "$IMAGE_NAME" "$DOCKER_DIR"' in text

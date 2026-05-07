@@ -23,6 +23,7 @@ from kronos.security.cost_guardian import get_guardian
 from kronos.security.output_validator import validate_output
 from kronos.swarm_store import get_swarm
 from kronos.tts import get_voice_mode, set_voice_mode, should_synthesize, synthesize
+from kronos.vision import analyze_image_bytes, is_supported_image_mime, is_vision_configured
 
 log = logging.getLogger("kronos.bridge")
 
@@ -90,6 +91,68 @@ def _is_voice_message(event) -> bool:
     return any(
         isinstance(attr, DocumentAttributeAudio) and attr.voice
         for attr in doc.attributes
+    )
+
+
+def _image_mime_type(event) -> str:
+    if getattr(event.message, "photo", None):
+        return "image/jpeg"
+    doc = getattr(getattr(event.message, "media", None), "document", None)
+    return str(getattr(doc, "mime_type", "") or "")
+
+
+def _is_image_message(event) -> bool:
+    if not getattr(event.message, "media", None):
+        return False
+    return is_supported_image_mime(_image_mime_type(event))
+
+
+async def _download_image_bytes(event) -> tuple[bytes, str]:
+    mime_type = _image_mime_type(event) or "image/jpeg"
+    suffix = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+    }.get(mime_type, ".img")
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+        await event.message.download_media(file=tmp_path)
+        with open(tmp_path, "rb") as f:
+            return f.read(), mime_type
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+async def _analyze_image_message(event, caption: str) -> str:
+    if not is_vision_configured():
+        return (
+            "Я получил изображение, но vision model не настроена. "
+            "Нужно установить и авторизовать Codex CLI (`codex login`) "
+            "или включить KAOS_VISION_PROVIDER=openai-api."
+        )
+    image_bytes, mime_type = await _download_image_bytes(event)
+    result = await analyze_image_bytes(
+        image_bytes,
+        mime_type=mime_type,
+        context=caption,
+    )
+    return result.text
+
+
+def _compose_image_agent_message(caption: str, image_analysis: str) -> str:
+    caption = caption.strip()
+    user_request = caption or "Пользователь отправил изображение без подписи."
+    return (
+        f"{user_request}\n\n"
+        "[Vision analysis]\n"
+        f"{image_analysis}\n\n"
+        "Ответь пользователю на основе анализа изображения. Если пользователь просит OCR, "
+        "верни извлечённый текст; если это документ/скриншот/чек, кратко классифицируй "
+        "и выдели важные детали/action items."
     )
 
 
@@ -537,8 +600,9 @@ async def run_bridge(agent: KronosAgent) -> None:
 
         is_dm = event.is_private
         voice = _is_voice_message(event)
+        image = _is_image_message(event)
 
-        if not text and not voice:
+        if not text and not voice and not image:
             return
 
         # Swarm ledger ingress: record every observed group message before
@@ -659,7 +723,9 @@ async def run_bridge(agent: KronosAgent) -> None:
             log.info("Ignoring DM from unauthorized Telegram user %s", user_id)
             return
 
-        # Voice transcription
+        image_analysis = ""
+
+        # Voice transcription / image analysis
         if voice:
             if not settings.groq_api_key:
                 return
@@ -677,6 +743,18 @@ async def run_bridge(agent: KronosAgent) -> None:
                 return
             if not clean_text:
                 return
+        elif image:
+            clean_text = _strip_mention(text) if not is_dm else text
+            try:
+                image_analysis = await _analyze_image_message(event, clean_text)
+            except Exception as e:
+                log.error("[Vision] Failed: %s", e)
+                reply = (
+                    "Не удалось обработать изображение. "
+                    "Проверь, что включён OpenAI/Codex vision provider и формат изображения поддерживается."
+                )
+                await _send_to_chat(event.chat_id, reply, topic_id=_extract_topic_id(event))
+                return
         else:
             clean_text = _strip_mention(text) if not is_dm else text
 
@@ -685,7 +763,7 @@ async def run_bridge(agent: KronosAgent) -> None:
         # into session history — it disappears after the current LLM call.
         # This is what prevents peer text from being echoed back verbatim.
         group_extra_context = ""
-        invoke_message = clean_text
+        invoke_message = _compose_image_agent_message(clean_text, image_analysis) if image else clean_text
         invoke_source_kind = "user"
         invoke_persist = True
 

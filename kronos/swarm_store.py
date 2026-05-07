@@ -28,6 +28,7 @@ same ledger and can agree on "who did what".
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from dataclasses import dataclass
@@ -154,10 +155,14 @@ def _schema(conn) -> None:
             thread_id TEXT NOT NULL,
             role TEXT NOT NULL,
             content TEXT NOT NULL,
-            created_at REAL NOT NULL
+            created_at REAL NOT NULL,
+            fingerprint TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_session_messages_thread
             ON session_messages(agent_name, thread_id, created_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_session_messages_fingerprint
+            ON session_messages(fingerprint)
+            WHERE fingerprint IS NOT NULL;
 
         CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_fts
             USING fts5(content, tokenize='unicode61', content='session_messages', content_rowid='id');
@@ -190,6 +195,19 @@ def _schema(conn) -> None:
             ON feedback(reaction, created_at DESC);
         """
     )
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(session_messages)").fetchall()
+    }
+    if "fingerprint" not in columns:
+        conn.execute("ALTER TABLE session_messages ADD COLUMN fingerprint TEXT")
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_session_messages_fingerprint
+                ON session_messages(fingerprint)
+                WHERE fingerprint IS NOT NULL
+            """
+        )
 
 
 @dataclass
@@ -595,16 +613,29 @@ class SwarmStore:
         thread_id: str,
         role: str,
         content: str,
-    ) -> None:
-        """Index a single message from a session into the cross-agent FTS store."""
-        self._db.write(
+        fingerprint: str = "",
+    ) -> bool:
+        """Index a single message from a session into the cross-agent FTS store.
+
+        ``fingerprint`` is optional for callers that do not have a stable
+        per-session position. When absent, we derive a content-based key to
+        keep repeated backfills from duplicating rows.
+        """
+        clean_content = content.strip()
+        if not clean_content:
+            return False
+        fingerprint = fingerprint or hashlib.sha256(
+            f"{agent_name}\0{thread_id}\0{role}\0{clean_content}".encode()
+        ).hexdigest()
+        cursor = self._db.write(
             """
-            INSERT INTO session_messages
-                (agent_name, thread_id, role, content, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO session_messages
+                (agent_name, thread_id, role, content, created_at, fingerprint)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (agent_name, thread_id, role, content.strip(), time.time()),
+            (agent_name, thread_id, role, clean_content, time.time(), fingerprint),
         )
+        return bool(cursor and cursor.rowcount)
 
     def search_sessions(
         self,

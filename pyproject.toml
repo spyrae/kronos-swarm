@@ -33,6 +33,7 @@ dependencies = [
     "langchain-core>=0.3",
 
     # LangChain LLM providers
+    "openai>=1.0",
     "langchain-openai>=0.3",        # Kimi K2.5 via OpenAI-compatible API
     "langchain-deepseek>=1.0",
 

@@ -145,13 +145,14 @@ Auto-improvement of skill files:
 
 Dialectical user modeling:
 1. **Quantitative**: Pure Python analytics on audit.jsonl (peak hours, avg message length, tier distribution, response time)
-2. **Qualitative**: LLM analyzes last 30 conversations (DeepSeek lite)
+2. **Qualitative**: LLM analyzes last 30 conversations plus decision/preference snippets from session search
 3. **Dialectical**: Compare against previous model → validate/update/add hypotheses
-4. Categories: Communication Style, Topics & Interests, Work Patterns, Decision Making, Goals
-5. Each hypothesis has confidence: low/medium/high
-6. Save to `workspace/USER-MODEL.md` and `workspace/USER-PATTERNS.md`
+4. **Passive quality signals**: correction requests, slow responses, tool-heavy sessions, errors, and cost patterns without requiring likes/reactions
+5. Categories: Beliefs, Motivations, Decision Patterns, Tensions, Evolution
+6. Each belief has numeric confidence: 0.0-1.0
+7. Save to `workspace/USER-MODEL.md` and `workspace/USER-PATTERNS.md`
 
-**Dependencies:** audit.jsonl, USER-MODEL.md (previous model)
+**Dependencies:** audit.jsonl, session search index, USER-MODEL.md (previous model)
 **Notification:** Webhook → Telegram DM
 
 ### 11. market-review

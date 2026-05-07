@@ -246,6 +246,13 @@ KAOS can connect to tools, memory, external services, and scheduled jobs. The pu
 - Dynamic tool execution requires a Docker sandbox by default.
 - Telegram DMs are blocked until `ALLOWED_USERS` is set, unless `ALLOW_ALL_USERS=true`.
 
+For local dynamic-tool experiments, build the sandbox image first:
+
+```bash
+scripts/build-sandbox.sh
+ENABLE_DYNAMIC_TOOLS=true kaos doctor
+```
+
 See [docs/SECURITY.md](docs/SECURITY.md) and [SECURITY.md](SECURITY.md).
 
 ## Documentation

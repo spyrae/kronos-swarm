@@ -5,12 +5,17 @@ Executes /code/tool.py in a restricted environment.
 
 import json
 import sys
+from pathlib import Path
 
 
 def main() -> None:
     try:
-        with open("/code/tool.py") as f:
-            code = f.read()
+        tool_path = Path("/code/tool.py")
+        if not tool_path.exists():
+            print("sandbox ready")
+            return
+
+        code = tool_path.read_text(encoding="utf-8")
 
         namespace = {"__builtins__": __builtins__}
         exec(code, namespace)  # noqa: S102

@@ -4,6 +4,7 @@ Replaces LangGraph's AsyncSqliteSaver checkpointer.
 Stores messages as JSON in SQLite, keyed by thread_id.
 """
 
+import hashlib
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -23,6 +24,23 @@ log = logging.getLogger("kronos.session")
 # Keep small — large history causes LLM to copy prior patterns
 # (including hallucinated tool calls) instead of using tools.
 MAX_HISTORY = 30
+
+
+def _session_fts_fingerprint(
+    *,
+    agent_name: str,
+    thread_id: str,
+    position: int,
+    role: str,
+    content: str,
+) -> str:
+    """Stable key for idempotent cross-session FTS indexing."""
+    payload = json.dumps(
+        [agent_name, thread_id, position, role, content],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _serialize_message(msg: BaseMessage) -> dict:
@@ -137,15 +155,16 @@ class SessionStore:
 
     def _index_to_swarm_fts(
         self, thread_id: str, messages: list[BaseMessage],
-    ) -> None:
+    ) -> int:
         """Index session messages into swarm FTS. Non-blocking, non-fatal."""
         if not self._agent_name:
-            return
+            return 0
         try:
             from kronos.swarm_store import get_swarm
 
             swarm = get_swarm()
-            for msg in messages:
+            indexed = 0
+            for position, msg in enumerate(messages):
                 if isinstance(msg, HumanMessage):
                     role = "user"
                 elif isinstance(msg, AIMessage):
@@ -153,14 +172,53 @@ class SessionStore:
                 else:
                     continue
                 if msg.content and isinstance(msg.content, str) and len(msg.content) > 5:
-                    swarm.index_session_message(
+                    inserted = swarm.index_session_message(
                         agent_name=self._agent_name,
                         thread_id=thread_id,
                         role=role,
                         content=msg.content,
+                        fingerprint=_session_fts_fingerprint(
+                            agent_name=self._agent_name,
+                            thread_id=thread_id,
+                            position=position,
+                            role=role,
+                            content=msg.content,
+                        ),
                     )
+                    if inserted:
+                        indexed += 1
+            return indexed
         except Exception as e:
             log.warning("FTS indexing failed (non-fatal): %s", e)
+            return 0
+
+    async def backfill_swarm_fts(self) -> int:
+        """Index existing session rows into the shared session-search FTS store.
+
+        This is idempotent when the target swarm database has fingerprints.
+        """
+        if not self._agent_name:
+            log.info("Skipping session FTS backfill: agent_name is empty")
+            return 0
+
+        rows: list[tuple[str, str]] = []
+        async with self._open_db() as db:
+            await self._ensure_table(db)
+            cursor = await db.execute("SELECT thread_id, messages FROM sessions")
+            rows = await cursor.fetchall()
+
+        indexed = 0
+        for thread_id, raw_messages in rows:
+            try:
+                data = json.loads(raw_messages)
+                messages = [_deserialize_message(d) for d in data]
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                log.warning("Skipping malformed session %s during FTS backfill: %s", thread_id, e)
+                continue
+            indexed += self._index_to_swarm_fts(thread_id, messages)
+
+        log.info("Session FTS backfill complete: %d new messages indexed", indexed)
+        return indexed
 
     async def clear(self, thread_id: str) -> int:
         """Clear conversation history for a thread. Returns rows deleted."""

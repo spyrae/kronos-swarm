@@ -30,6 +30,10 @@ class Skill:
     tags: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
     tier: str = ""
+    imported_from: str = ""
+    source_url: str = ""
+    imported_at: str = ""
+    review_required: bool = False
 
 
 def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
@@ -84,12 +88,28 @@ def _parse_list_field(raw: str) -> list[str]:
     return [t.strip().strip("\"'") for t in stripped.split(",") if t.strip()]
 
 
+def _format_frontmatter_value(value: object) -> str:
+    """Format simple metadata values for YAML-ish frontmatter."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, list):
+        return "[" + ", ".join(str(item) for item in value) + "]"
+    return str(value)
+
+
 class SkillStore:
     """Central store for all skills. Loads from workspace/self/skills/."""
 
-    def __init__(self, workspace_path: str | None = None):
-        from kronos.workspace import ws
-        self._skills_dir = ws.skills_dir
+    def __init__(self, workspace_path: str | Path | None = None):
+        if workspace_path:
+            from kronos.workspace import Workspace
+
+            self._workspace = Workspace(workspace_path)
+        else:
+            from kronos.workspace import ws
+
+            self._workspace = ws
+        self._skills_dir = self._workspace.skills_dir
         self._skills: dict[str, Skill] = {}
         self._load_all()
 
@@ -117,6 +137,10 @@ class SkillStore:
             tags = _parse_list_field(meta.get("tags", ""))
             tools = _parse_list_field(meta.get("tools", ""))
             tier = meta.get("tier", "")
+            imported_from = meta.get("imported_from", "")
+            source_url = meta.get("source_url", "")
+            imported_at = meta.get("imported_at", "")
+            review_required = meta.get("review_required", "").lower() == "true"
 
             if not description:
                 # Fallback: extract first paragraph as description
@@ -143,6 +167,10 @@ class SkillStore:
                 tags=tags,
                 tools=tools,
                 tier=tier,
+                imported_from=imported_from,
+                source_url=source_url,
+                imported_at=imported_at,
+                review_required=review_required,
             )
 
         log.info("Loaded %d skills: %s", len(self._skills), list(self._skills.keys()))
@@ -173,7 +201,7 @@ class SkillStore:
         # Build frontmatter
         fm_lines = ["---"]
         for k, v in meta.items():
-            fm_lines.append(f"{k}: {v}")
+            fm_lines.append(f"{k}: {_format_frontmatter_value(v)}")
         fm_lines.append("---")
         fm_lines.append("")
         fm_lines.append(content)
@@ -192,10 +220,34 @@ class SkillStore:
             tags=_parse_list_field(meta.get("tags", "")),
             tools=_parse_list_field(meta.get("tools", "")),
             tier=meta.get("tier", ""),
+            imported_from=meta.get("imported_from", ""),
+            source_url=meta.get("source_url", ""),
+            imported_at=meta.get("imported_at", ""),
+            review_required=str(meta.get("review_required", "")).lower() == "true",
         )
         log.info("Skill added: %s (status=%s)", name, meta.get("status", "active"))
         self._generate_manifest_file()
         return skill_file
+
+    def update_status(self, name: str, status: str) -> bool:
+        """Update a skill status in frontmatter and refresh the manifest."""
+        skill = self._skills.get(name)
+        if not skill:
+            return False
+
+        raw = skill.path.read_text(encoding="utf-8")
+        meta, body = _parse_frontmatter(raw)
+        meta["status"] = status
+
+        fm_lines = ["---"]
+        for key, value in meta.items():
+            fm_lines.append(f"{key}: {_format_frontmatter_value(value)}")
+        fm_lines.extend(["---", "", body])
+        skill.path.write_text("\n".join(fm_lines), encoding="utf-8")
+
+        skill.status = status
+        self._generate_manifest_file()
+        return True
 
     def build_catalog(self) -> str:
         """Build L1 catalog string for system prompt injection.
@@ -214,7 +266,11 @@ class SkillStore:
                 refs_note = f" [refs: {ref_names}]"
             tier_note = f" ({skill.tier})" if skill.tier else ""
             tags_note = f" #{' #'.join(skill.tags)}" if skill.tags else ""
-            lines.append(f"- **{skill.name}**{tier_note}: {skill.description}{refs_note}{tags_note}")
+            status_note = " [draft; load for review before relying on it]" if skill.status == "draft" else ""
+            lines.append(
+                f"- **{skill.name}**{tier_note}: {skill.description}"
+                f"{status_note}{refs_note}{tags_note}"
+            )
 
         return "\n".join(lines)
 
@@ -222,7 +278,7 @@ class SkillStore:
         """Generate skills.json manifest for the hub."""
         skills_list = []
         for skill in self._skills.values():
-            skills_list.append({
+            row = {
                 "name": skill.name,
                 "version": skill.version,
                 "description": skill.description,
@@ -231,10 +287,20 @@ class SkillStore:
                 "tools": skill.tools,
                 "tier": skill.tier,
                 "status": skill.status,
-            })
+            }
+            if skill.imported_from:
+                row["imported_from"] = skill.imported_from
+            if skill.source_url:
+                row["source_url"] = skill.source_url
+            if skill.imported_at:
+                row["imported_at"] = skill.imported_at
+            if skill.review_required:
+                row["review_required"] = True
+            skills_list.append(row)
         return {
             "version": "1.0.0",
-            "agent": "kaos",
+            "standard": "agentskills-compatible",
+            "agent": self._workspace.root.name,
             "skills": skills_list,
             "generated_at": datetime.now(UTC).isoformat(),
         }

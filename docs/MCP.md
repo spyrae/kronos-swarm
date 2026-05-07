@@ -83,7 +83,14 @@ execution:
 REQUIRE_DYNAMIC_TOOL_SANDBOX=true
 ```
 
-If Docker/sandbox support is unavailable, dynamic execution should fail closed.
+Build the local sandbox image before enabling dynamic tools:
+
+```bash
+scripts/build-sandbox.sh
+ENABLE_DYNAMIC_TOOLS=true kaos doctor
+```
+
+If Docker or the sandbox image is unavailable, dynamic execution fails closed.
 
 ## Server Ops
 

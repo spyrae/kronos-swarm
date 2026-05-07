@@ -9,12 +9,14 @@ Supports:
 import logging
 import re
 import urllib.request
+from datetime import UTC, datetime
 
-from kronos.skills.store import SkillStore, _parse_frontmatter
+from kronos.skills.store import SkillStore, _parse_frontmatter, _parse_list_field
 
 log = logging.getLogger("kronos.skills.hub")
 
-GITHUB_RAW_URL = "https://raw.githubusercontent.com/{user}/{repo}/main/{path}/SKILL.md"
+GITHUB_RAW_URL = "https://raw.githubusercontent.com/{user}/{repo}/main/{path}"
+SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,79}$")
 
 
 def _fetch_url(url: str, timeout: int = 15) -> str:
@@ -37,7 +39,7 @@ def _fetch_url(url: str, timeout: int = 15) -> str:
 
 
 def _parse_github_source(source: str) -> str | None:
-    """Parse github:user/repo/skill-name into raw GitHub content URL.
+    """Parse github:user/repo/path into a raw GitHub SKILL.md URL.
 
     Args:
         source: Source string in 'github:user/repo/skill-name' format.
@@ -45,11 +47,51 @@ def _parse_github_source(source: str) -> str | None:
     Returns:
         Raw GitHub URL or None if format does not match.
     """
-    match = re.match(r"github:([\w.-]+)/([\w.-]+)/([\w.-]+)", source)
+    match = re.match(r"^github:([\w.-]+)/([\w.-]+)/(.+)$", source)
     if not match:
         return None
-    user, repo, skill = match.groups()
-    return GITHUB_RAW_URL.format(user=user, repo=repo, path=skill)
+    user, repo, raw_path = match.groups()
+    path = raw_path.strip().strip("/")
+    if not path or ".." in path.split("/"):
+        return None
+    if not path.endswith("SKILL.md"):
+        path = f"{path}/SKILL.md"
+    return GITHUB_RAW_URL.format(user=user, repo=repo, path=path)
+
+
+def _resolve_source(source: str) -> str | None:
+    url = _parse_github_source(source)
+    if url:
+        return url
+    if source.startswith(("http://", "https://")):
+        return source
+    return None
+
+
+def _validate_skill_package(content: str) -> tuple[bool, str, dict[str, str], str]:
+    """Validate a portable SKILL.md package."""
+    if not content.strip():
+        return False, "Empty skill content received.", {}, ""
+
+    meta, body = _parse_frontmatter(content)
+    name = meta.get("name", "").strip()
+    if not name:
+        return False, "Skill has no 'name' in frontmatter.", meta, body
+    if not SKILL_NAME_RE.match(name):
+        return (
+            False,
+            "Skill name must be a safe slug: lowercase letters, numbers, dash, or underscore.",
+            meta,
+            body,
+        )
+
+    description = meta.get("description", "").strip()
+    if not description:
+        return False, "Skill has no 'description' in frontmatter.", meta, body
+    if not body.strip():
+        return False, "Skill body is empty.", meta, body
+
+    return True, "", meta, body
 
 
 def import_skill(source: str, store: SkillStore) -> str:
@@ -66,15 +108,12 @@ def import_skill(source: str, store: SkillStore) -> str:
         Human-readable status message describing the outcome.
     """
     # Resolve source to a concrete URL
-    url = _parse_github_source(source)
+    url = _resolve_source(source)
     if not url:
-        if source.startswith("http"):
-            url = source
-        else:
-            return (
-                f"Invalid source: '{source}'. "
-                "Use a URL or 'github:user/repo/skill-name' format."
-            )
+        return (
+            f"Invalid source: '{source}'. "
+            "Use a URL or 'github:user/repo/skill-name' format."
+        )
 
     # Fetch SKILL.md content
     try:
@@ -82,30 +121,42 @@ def import_skill(source: str, store: SkillStore) -> str:
     except Exception as e:
         return f"Failed to fetch skill from '{url}': {e}"
 
-    if not content.strip():
-        return "Empty skill content received."
-
     # Parse and validate frontmatter
-    meta, body = _parse_frontmatter(content)
-
-    name = meta.get("name", "").strip()
-    if not name:
-        return "Skill has no 'name' in frontmatter."
-
-    description = meta.get("description", "").strip()
-    if not description:
-        return "Skill has no 'description' in frontmatter."
+    valid, reason, meta, body = _validate_skill_package(content)
+    if not valid:
+        return reason
 
     # Guard against name collisions
+    name = meta["name"].strip()
     existing = store.get(name)
     if existing:
         return (
             f"Skill '{name}' already exists. Remove it first to re-import."
         )
 
-    # Log required tools for informational purposes (no enforcement yet)
-    tools_raw = meta.get("tools", "")
-    required_tools = [t.strip() for t in tools_raw.strip("[]").split(",") if t.strip()]
+    # External skills are reviewable drafts by default. Approval is explicit.
+    original_status = meta.get("status", "active")
+    tags = _parse_list_field(meta.get("tags", ""))
+    for tag in ("external", "imported"):
+        if tag not in tags:
+            tags.append(tag)
+
+    imported_at = datetime.now(UTC).isoformat()
+    meta = {
+        **meta,
+        "status": "draft",
+        "review_required": "true",
+        "imported_from": source,
+        "source_url": url,
+        "imported_at": imported_at,
+        "created_by": meta.get("created_by", "external-import"),
+        "tags": "[" + ", ".join(tags) + "]",
+    }
+    if original_status and original_status != "draft":
+        meta["imported_original_status"] = original_status
+
+    # Log required tools for informational purposes (no enforcement yet).
+    required_tools = _parse_list_field(meta.get("tools", ""))
     if required_tools:
         log.info("Imported skill '%s' requires tools: %s", name, required_tools)
 
@@ -118,7 +169,8 @@ def import_skill(source: str, store: SkillStore) -> str:
 
     return (
         f"Skill '{name}' v{version} imported successfully "
-        f"(author: {author}, tools: {tools_display})"
+        f"as draft (author: {author}, tools: {tools_display}). "
+        "Review it with load_skill, then approve_skill if it is safe."
     )
 
 

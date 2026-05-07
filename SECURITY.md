@@ -29,6 +29,8 @@ Fresh installs are conservative:
 
 These defaults are intentional. Enable risky capabilities only in trusted local environments.
 
+When enabling dynamic tools, build the local sandbox image with `scripts/build-sandbox.sh` first. `kaos doctor` reports a hard failure if `ENABLE_DYNAMIC_TOOLS=true` but Docker or `kronos-sandbox:latest` is unavailable.
+
 ## Threat Model
 
 Primary risks:
@@ -41,7 +43,7 @@ Primary risks:
 - Scheduled jobs repeating a harmful or expensive action.
 - Dashboard exposure beyond localhost without proper auth and network controls.
 
-Security controls currently include input validation, external-content sanitization, output redaction, loop detection, cost guarding, capability gates, and sandbox-required dynamic tool execution.
+Security controls currently include input validation, external-content sanitization, output redaction, PII masking for logs/traces/audit previews, loop detection, cost guarding, capability gates, and sandbox-required dynamic tool execution.
 
 See [docs/SECURITY.md](docs/SECURITY.md) for implementation details.
 

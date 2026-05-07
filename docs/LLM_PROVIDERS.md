@@ -40,8 +40,24 @@ fails, or enters cooldown, KAOS tries the next provider.
 ```env
 KAOS_STANDARD_PROVIDER_CHAIN=openai
 KAOS_LITE_PROVIDER_CHAIN=openai
-OPENAI_API_KEY=sk-proj-...
 KAOS_PROVIDER_OPENAI_MODEL=gpt-4.1-mini
+# Default Telegram image/OCR intake uses Codex CLI OAuth credentials.
+KAOS_VISION_PROVIDER=codex-cli
+KAOS_VISION_MODEL=gpt-5.2-codex
+```
+
+Telegram image messages use Codex CLI by default, so `OPENAI_API_KEY` is not
+required for image/OCR intake if the machine has already run `codex login`.
+Codex CLI accepts image paths and uses the locally stored OAuth/API credentials.
+The vision path analyzes the image first, then passes the extracted
+text/description into the normal KAOS dialogue flow.
+
+If you want to bypass Codex CLI and call the OpenAI Responses API directly:
+
+```env
+KAOS_VISION_PROVIDER=openai-api
+OPENAI_API_KEY=sk-proj-...
+KAOS_VISION_MODEL=gpt-5.2-codex
 ```
 
 ### OpenRouter

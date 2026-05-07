@@ -11,6 +11,7 @@ from functools import lru_cache
 from kronos.config import settings
 from kronos.memory import fts
 from kronos.memory.hybrid import merge_hybrid_results
+from kronos.security.pii import mask_pii
 
 log = logging.getLogger("kronos.memory")
 
@@ -134,7 +135,7 @@ def add_memories(
         mem = get_memory()
         kwargs = {"user_id": user_id}
         if session_id:
-            kwargs["metadata"] = {"session_id": session_id}
+            kwargs["metadata"] = {"session_id": mask_pii(session_id)}
 
         result = mem.add(messages, **kwargs)
         extracted = result.get("results", [])

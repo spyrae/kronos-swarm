@@ -5,6 +5,8 @@ import logging
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from kronos.logging import add_pii_filter
+
 # Connected WebSocket clients for log streaming
 log_clients: set[WebSocket] = set()
 
@@ -34,6 +36,7 @@ def install_log_handler() -> None:
     handler = WebSocketLogHandler()
     handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     handler.setLevel(logging.INFO)
+    add_pii_filter(handler)
     logging.getLogger().addHandler(handler)
 
 

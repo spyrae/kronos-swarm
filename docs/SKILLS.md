@@ -106,9 +106,6 @@ Current local flow:
 - Load supporting files through `load_skill_reference(name, ref)`.
 - Disable by removing or moving the skill directory out of the workspace.
 
-Future template/pack commands should preserve this same file layout and avoid
-overwriting user edits without confirmation.
-
 Bundled packs live in `templates/skill-packs/`:
 
 ```bash
@@ -119,6 +116,20 @@ kaos skills install-pack research --agent personal-operator --dry-run
 
 Pack installation copies `skills/*` into `workspaces/<agent>/self/skills/`.
 Existing skills are skipped unless `--force` is provided.
+
+Portable skills can also be imported from a direct `SKILL.md` URL or GitHub
+source:
+
+```bash
+kaos skills import https://example.com/path/SKILL.md --agent personal-operator
+kaos skills import github:org/repo/research-brief --agent personal-operator
+kaos skills export research-brief --agent personal-operator --output /tmp/SKILL.md
+```
+
+External imports are always written as `status: draft` with source metadata
+(`imported_from`, `source_url`, `imported_at`) and `review_required: true`.
+Review with `load_skill(...)`, then approve explicitly with `approve_skill(...)`
+if the procedure is safe and useful.
 
 ## Skills Vs MCP Tools
 
