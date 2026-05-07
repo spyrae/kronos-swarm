@@ -22,7 +22,7 @@ _PRODUCT_DESC = os.environ.get(
     "your product",
 )
 
-DIGEST_PROMPT = f"""You are a competitive intelligence analyst for {_PRODUCT_DESC}.
+DIGEST_PROMPT = """You are a competitive intelligence analyst for {product_desc}.
 
 Here are changes detected across all monitoring channels in the last 24 hours:
 
@@ -163,6 +163,7 @@ class CompetitorMonitor:
         info = [c for c in changes if c.severity == Severity.INFO]
 
         prompt = DIGEST_PROMPT.format(
+            product_desc=_PRODUCT_DESC,
             critical="\n".join(c.summary for c in critical) or "None",
             important="\n".join(c.summary for c in important) or "None",
             info="\n".join(c.summary for c in info) or "None",
