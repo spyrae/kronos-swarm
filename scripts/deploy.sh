@@ -60,11 +60,16 @@ sync_files() {
   # Sync code — explicitly exclude everything that must survive deploy.
   echo "Syncing files..."
   rsync -avz --delete \
+    --exclude='.DS_Store' \
     --exclude='.git/' \
+    --exclude='.pytest_cache/' \
+    --exclude='.ruff_cache/' \
     --exclude='__pycache__/' \
     --exclude='*.egg-info/' \
     --exclude='build/' \
     --exclude='dist/' \
+    --exclude='mcp-server.log' \
+    --exclude='node_modules/' \
     --exclude='data/' \
     --exclude='.env' \
     --exclude='.env.*' \
