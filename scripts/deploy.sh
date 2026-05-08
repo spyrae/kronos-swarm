@@ -74,6 +74,7 @@ sync_files() {
     --exclude='.env' \
     --exclude='.env.*' \
     --exclude='*.session' \
+    --exclude='*.session-*' \
     --exclude='.venv/' \
     --exclude='workspaces/' \
     "$SOURCE_DIR/" "$target"
